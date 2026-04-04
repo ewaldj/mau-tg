@@ -28,7 +28,7 @@ Performance multicast and unicast traffic generation and analysis tool suite wit
 - **CSV Logging**: Export detailed packet data
 - **Loss Detection**: Track missing and out-of-order packets
 
-### mau-time v1.0 - Time Sync Server
+### mau-time.py  - Time Sync Server
 Central time synchronization server providing relative time reference for accurate delay measurement across distributed systems.
 
 **Key Features:**

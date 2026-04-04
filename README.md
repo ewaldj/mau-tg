@@ -4,7 +4,7 @@ Performance multicast and unicast traffic generation and analysis tool suite wit
 
 ## Installation
 ```
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ewaldj/eping/refs/heads/main/e-install.sh)"
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ewaldj/mau-tg/refs/heads/main/e-install.sh)"
 ```
 
 ## MAU-TOOLS 

@@ -2,6 +2,11 @@
 
 Performance multicast and unicast traffic generation and analysis tool suite with Time Sync support for accurate one-way delay measurement.
 
+## Installation
+```
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ewaldj/eping/refs/heads/main/e-install.sh)"
+```
+
 ## MAU-TOOLS 
 
 ### mau-send.py - Multicast/Unicast Sender
@@ -34,25 +39,6 @@ Central time synchronization server providing relative time reference for accura
 - Automatic fallback from port 443 to 8443
 
 
-## Installation
-
-```bash
-# Make executable
-chmod +x mau-time mau-send mau-recv
-
-# Run directly
-./mau-time
-./mau-send
-./mau-recv
-```
-
-Or copy to PATH:
-```bash
-sudo cp mau-time mau-send mau-recv /usr/local/bin/
-mau-time
-mau-send
-mau-recv
-```
 
 ## Quick Start
 

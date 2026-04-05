@@ -1,267 +1,290 @@
-# MAU - Multicast AND Unicast Traffic Generator v1.0
+# MAU — Multicast/AND/Unicast Traffic Generator & Analyzer
 
-Performance multicast and unicast traffic generation and analysis tool suite with Time Sync support for accurate one-way delay measurement.
+A lightweight, dependency-free Python toolkit for generating and analyzing network traffic with accurate one-way delay (OWD) measurement. Designed for network engineers who need to verify QoS policies, measure path latency, detect packet loss, and stress-test links.
+
+## Features
+
+- **Multicast, Unicast & Broadcast** — send to any destination type
+- **One-Way Delay Measurement** — NTP-style 4-timestamp protocol, no third-party time server required
+- **Per-Interval Statistics** — throughput, delay (avg/min/max), loss, DSCP tracking
+- **Burst Mode** — saturate links at max speed or with a configurable bandwidth limit
+- **DSCP/QoS Marking** — set and track DiffServ code points end-to-end
+- **Sender Restart Detection** — receiver automatically resets sequence tracking
+- **CSV Export** — log every packet for post-analysis
+- **Wireshark Dissector** — included Lua plugin for protocol inspection
+- **Zero Dependencies** — Python 3.10+ standard library only
+- **Cross-Platform** — tested on Linux (x86/ARM), macOS, Raspberry Pi OS
 
 ## Installation
+
 ```
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ewaldj/mau-tg/refs/heads/main/e-install.sh)"
 ```
+ 
+or 
 
-## MAU-TOOLS 
-
-### mau-send.py - Multicast/Unicast Sender
-- **Normal Mode**: Precise rate-limited packet transmission (configurable pps)
-- **Burst Mode**: Maximum speed transmission (500+ Mbit/s)
-- **Multicast & Unicast**: Support for both protocols
-- **Time Sync**: Accurate one-way delay measurement
-- **DSCP Support**: QoS tagging with automatic naming
-- **Interactive Menu**: Easy configuration UI
-- **Persistent Config**: Save and load settings
-
-### mau-recv.py - Multicast/Unicast Receiver 
-- **Multicast Receiver**: Join multicast groups automatically
-- **Unicast Receiver**: Listen on own IP address
-- **Dual Mode**: Receive both unicast and multicast simultaneously
-- **Per-Packet Tracking**: Display each packet with DSCP, delay, status
-- **Optional Summary**: Aggregate statistics at configurable intervals
-- **DSCP Analysis**: Per-DSCP-class statistics and delay tracking
-- **CSV Logging**: Export detailed packet data
-- **Loss Detection**: Track missing and out-of-order packets
-
-### mau-time.py  - Time Sync Server
-Central time synchronization server providing relative time reference for accurate delay measurement across distributed systems.
-
-**Key Features:**
-- Sends relative time (microseconds since server start)
-- Consistent time reference for all clients
-- Tracks sender and receiver connections
-- Thread-based concurrent client handling
-- Automatic fallback from port 443 to 8443
-
-
+```bash
+git clone https://github.com/ewaldj/mau.git
+cd mau
+chmod +x mau-send.py mau-recv.py
+```
 
 ## Quick Start
 
-### Terminal 1: Start Time Sync Server
 ```bash
-mau-time
-# or with custom port
-mau-time --port 8443
+# Terminal 1: Start sender (includes embedded time sync server)
+./mau-send.py -d 239.1.1.1 -p 5005 --pps 100
+
+# Terminal 2: Start receiver with OWD delay measurement
+./mau-recv.py -g 239.1.1.1 -p 5005 --sender-ip 192.168.1.10 -s 5
 ```
 
-### Terminal 2: Send Multicast Traffic
+## mau-send
+
+Traffic generator with interactive menu and CLI modes.
+
+### Interactive Menu
+
 ```bash
-# Interactive menu
-mau-send
-
-# Or direct with CLI
-mau-send -d 239.1.1.1 -p 5005 -s 1400 --pps 5000
-
-# Burst mode (max speed)
-mau-send -d 239.1.1.1 -p 5005 -s 1400 --burst
+./mau-send.py
 ```
 
-### Terminal 3: Receive and Analyze
+```
+╔════════════════════════════════════╗
+║  mau-send v0.37 - Configuration
+╚════════════════════════════════════╝
+
+Current Settings:
+  1. Destination Address:    239.1.1.1
+  2. Destination Port:       5005
+  3. Packet Size:            1500 bytes
+  4. Rate (pps):             100.0
+  5. DSCP Value:             46
+  6. OWD Sync Port:          5556
+  7. TTL:                    32
+  8. Burst Bandwidth Limit:  unlimited
+
+  0. START (Normal Mode)
+  b. BURST-MODE
+  s. Save Config
+  q. Exit
+```
+
+Ctrl+C during sending returns to the menu. The OWD sync server starts immediately and runs throughout.
+
+### CLI Mode
+
 ```bash
-# Multicast reception
-mau-recv -g 239.1.1.1 -p 5005
+# Constant rate
+./mau-send.py -d 239.1.1.1 -p 5005 -s 1500 --pps 1000 --dscp 46
 
-# With 10-second summary intervals
-mau-recv -g 239.1.1.1 -p 5005 -s 10
+# Burst: maximum speed
+./mau-send.py -d 10.0.0.5 --burst
 
-# Unicast mode (listen on own IP)
-mau-recv -u -p 5005
+# Burst: limited to 200 Mbit/s
+./mau-send.py -d 10.0.0.5 -s 1500 --burst --burst-mbps 200
+
+# Broadcast
+./mau-send.py -d 172.17.17.255 -p 5005 --pps 50
+```
+
+### CLI Options
+
+| Option | Description |
+|--------|-------------|
+| `-d`, `--destination` | Destination IP address |
+| `-p`, `--port` | Destination UDP port |
+| `-s`, `--size` | Packet size in bytes (wire size, including IP/UDP headers) |
+| `--pps` | Packets per second |
+| `--dscp` | DSCP value (0–63) |
+| `--burst` | Burst mode (send as fast as possible) |
+| `--burst-mbps` | Bandwidth limit for burst mode in Mbit/s (0 = unlimited) |
+| `--sync-port` | OWD time sync server port (default: 5556) |
+| `-m`, `--menu` | Force interactive menu |
+| `--version` | Show version |
+
+### Packet Size
+
+The `--size` / menu option specifies the **wire size** (Layer 3 IP packet). The tool automatically subtracts the 28-byte IP/UDP header overhead. For example, entering 1500 produces a 1472-byte UDP payload, resulting in exactly 1500 bytes on the wire — compatible with standard 1500-byte MTU without fragmentation.
+
+### Configuration
+
+Settings are persisted to `~/.mau-send/config.json` when saved via the menu.
+
+## mau-recv
+
+Traffic receiver with real-time statistics, OWD measurement, and CSV logging.
+
+### Usage
+
+```bash
+# Multicast with per-packet display
+./mau-recv.py -g 239.1.1.1 -p 5005 --sender-ip 192.168.1.10
+
+# Summary every 5 seconds
+./mau-recv.py -g 239.1.1.1 -p 5005 --sender-ip 192.168.1.10 -s 5
+
+# Unicast mode
+./mau-recv.py -u -p 5005 --sender-ip 192.168.1.10 -s 2
 
 # With CSV logging
-mau-recv -g 239.1.1.1 -p 5005 -l traffic.csv
+./mau-recv.py -g 239.1.1.1 --sender-ip 192.168.1.10 -s 10 -l capture.csv
 ```
 
-## Command Line Options
-
-### mau-time
+### Per-Packet Display (default)
 
 ```
--p, --port PORT             Listen port (default: 443, fallback: 8443)
---version                   Show version
+10:45:16 | Seq:    27 | Size: 1500 | DSCP:EF    | Delay:  0.42ms | OK    | Loss:  0.00%
+10:45:16 | Seq:    28 | Size: 1500 | DSCP:EF    | Delay:  0.38ms | OK    | Loss:  0.00%
 ```
 
-### mau-send
+### Interval Summary (`-s`)
 
 ```
--d, --destination ADDRESS   Destination address (default: 239.1.1.1)
--p, --port PORT             Destination port (default: 5005)
--s, --size BYTES            Packet size (default: 256)
---pps RATE                  Packets per second (default: 10)
---dscp VALUE                DSCP value (0-63, default: 0)
---sync-server HOST          Time Sync Server (default: localhost)
---sync-port PORT            Time Sync Port (default: 443)
---burst                     Burst mode: send as fast as possible
--m, --menu                  Interactive configuration menu
---version                   Show version
+20:47:37 |      0–2s |  695.81 Mbps |  1500B | DSCP:BE    | OK     | Pkt:    58023 | Loss: 0.00% Pkt:     0 | Dly(ms): avg:0.42 min:0.33 max:0.55
+20:47:39 |      2–4s |  697.24 Mbps |  1500B | DSCP:BE    | OK     | Pkt:    58104 | Loss: 0.00% Pkt:     0 | Dly(ms): avg:0.28 min:0.19 max:0.96
+20:47:41 |      4–6s |    0.00 Mbps |  1500B | DSCP:BE    | no traffic received
 ```
 
-### mau-recv
+All values are calculated **per interval** and reset after each line. The final summary on Ctrl+C shows lifetime totals.
+
+### CLI Options
+
+| Option | Description |
+|--------|-------------|
+| `-g`, `--group` | Multicast group (default: 239.1.1.1) |
+| `-p`, `--port` | Listen port (default: 5005) |
+| `-u`, `--unicast` | Unicast mode (bind to own IP) |
+| `-s`, `--summary` | Summary interval in seconds (default: per-packet) |
+| `-l`, `--log` | CSV log file (saved to `~/.mau-recv/`) |
+| `--sender-ip` | Sender IP for OWD time sync (required for delay values) |
+| `--sync-port` | OWD sync port on sender (default: 5556) |
+| `--version` | Show version |
+
+### Delay Measurement
+
+Without `--sender-ip`, delay values are shown as `n/a`. When specified, the receiver performs an NTP-style 4-timestamp handshake with the sender's embedded sync server:
+
+1. Warmup phase (3 packets, discarded)
+2. Best-of-5 measurement (lowest RTT selected)
+3. Background resync every 30 seconds to track clock drift
+
+The accuracy depends on path symmetry. For symmetric paths the OWD is exact; for asymmetric paths the error is half the asymmetry — typically well within ±1–2ms on LAN/WAN.
+
+## Protocol
+
+MAU uses a custom UDP protocol with embedded timestamps:
 
 ```
--g, --group ADDRESS         Multicast group (default: 239.1.1.1)
--p, --port PORT             Listen port (default: 5005)
--u, --unicast               Unicast mode (listen on own IP)
--s, --summary SECONDS       Summary interval (optional, per-packet default)
--l, --log FILE              CSV log file (optional)
---sync-server HOST          Time Sync Server (default: localhost)
---sync-port PORT            Time Sync Port (default: 443)
---version                   Show version
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                      Sequence Number (32)                     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
+|                   Timestamp in µs (64)                        |
+|                    CLOCK_REALTIME                              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                      Payload Padding                          |
+|                    (filled with 0x58)                         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                          CRC (32)                             |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
+
+| Field | Offset | Size | Format | Description |
+|-------|--------|------|--------|-------------|
+| Sequence | 0 | 4 bytes | uint32 BE | Packet counter, starts at 0 |
+| Timestamp | 4 | 8 bytes | uint64 BE | Microseconds since Unix epoch |
+| Padding | 12 | variable | bytes | Filled with `0x58` (`X`) |
+| CRC | last 4 | 4 bytes | uint32 BE | `sum(preceding_bytes) & 0xFF` |
+
+Minimum UDP payload: 16 bytes. All fields are big-endian.
+
+### OWD Time Sync Protocol
+
+The sender runs an embedded UDP time sync server (default port 5556). Receivers measure their clock offset using a 4-timestamp exchange:
+
+```
+Receiver                          Sender
+   |--- REQ {t1_ns} ------------->|  T1: receiver TX
+   |                              |  T2: sender RX
+   |<-- RSP {t1,t2,t3_ns} -------|  T3: sender TX
+   |                              |  T4: receiver RX
+```
+
+```
+RTT    = (T4 - T1) - (T3 - T2)
+Offset = ((T2 - T1) + (T3 - T4)) / 2
+OWD    = receiver_now - sender_timestamp + offset
+```
+
+Wire format: JSON over UDP (`{"type":"req","t1_ns":<int>}` / `{"type":"rsp","t1_ns":...,"t2_ns":...,"t3_ns":...}`).
+
+## Wireshark Integration
+
+A Lua dissector is included for protocol analysis. See [mau_protocol.lua](wireshark/mau_protocol.lua) and its [README](wireshark/README.md) for installation and usage.
 
 ## Examples
 
-### Multicast Throughput Test
+### QoS Verification
+
+Verify that DSCP EF (46) traffic receives priority treatment:
+
 ```bash
-# Sender: 1400 byte packets at 10,000 pps = 112 Mbit/s
-mau-send -d 239.1.1.1 -p 5005 -s 1400 --pps 10000
+# Sender: mark traffic as EF
+./mau-send.py -d 239.1.1.1 -s 1500 --pps 1000 --dscp 46
 
-# Receiver with 10-second summaries
-mau-recv -g 239.1.1.1 -p 5005 -s 10
+# Receiver: check delay and loss
+./mau-recv.py -g 239.1.1.1 --sender-ip 10.0.0.1 -s 5
 ```
 
-### Burst Mode Performance Test
+### Link Stress Test
+
+Saturate a link at a specific bandwidth:
+
 ```bash
-# Sender: Maximum speed (500+ Mbit/s possible)
-mau-send -d 239.1.1.1 -p 5005 -s 1400 --burst
-
-# Receiver
-mau-recv -g 239.1.1.1 -p 5005 -s 5
+# 500 Mbit/s burst with 1500-byte packets
+./mau-send.py -d 10.0.0.5 -s 1500 --burst --burst-mbps 500
 ```
 
-### Unicast Stream
+### Multipath / Asymmetry Detection
+
+Compare OWD in both directions by running sender+receiver on each end:
+
 ```bash
-# Sender to specific IP
-mau-send -d 192.168.1.100 -p 5005 -s 1400 --pps 1000
+# Host A → Host B
+hostA$ ./mau-send.py -d 10.0.0.2 --pps 10
+hostB$ ./mau-recv.py -u --sender-ip 10.0.0.1 -s 10
 
-# Receiver on that IP
-mau-recv -u -p 5005
+# Host B → Host A
+hostB$ ./mau-send.py -d 10.0.0.1 --pps 10
+hostA$ ./mau-recv.py -u --sender-ip 10.0.0.2 -s 10
 ```
 
-### QoS Testing with DSCP
+### Broadcast Testing
+
 ```bash
-# Sender with EF (Expedited Forwarding)
-mau-send -d 239.1.1.1 -p 5005 -s 1400 --dscp 46 --pps 5000
-
-# Receiver - shows DSCP in output
-mau-recv -g 239.1.1.1 -p 5005 -s 10
+# Subnet broadcast /24 
+./mau-send.py -d 172.17.17.255 -p 5005 -s 256 --pps 10
 ```
 
-### Data Logging
-```bash
-# Receiver logs to CSV
-mau-recv -g 239.1.1.1 -p 5005 -l traffic.csv
-
-# CSV contains: Timestamp, Seq, Delay_ms, DSCP, DSCP_Name, Status
-```
-
-## Output Format
-
-### Per-Packet Display
-```
-HH:MM:SS Seq:      0 Size:  1400 DSCP:EF     Delay:   5.47ms OK       Loss:  0.00%
-HH:MM:SS Seq:      1 Size:  1400 DSCP:EF     Delay:   5.87ms OK       Loss:  0.00%
-HH:MM:SS Seq:      2 Size:  1400 DSCP:AF21   Delay:   5.59ms OK       Loss:  0.00%
-```
-
-### Summary Display (every N seconds)
-```
-[00:00:10] Pkts:  10000 Tput:112.00Mbps Delay:  5.23ms Loss:  0.00% Misorder:  0
-  └─ BE    : 5000 pkts (50.0%) Delay:  5.25ms
-  └─ EF    : 5000 pkts (50.0%) Delay:  5.21ms
-```
-
-### Burst Mode Statistics
-```
-╔════════════════════════════════════
-║   BURST Statistics
-║   Time: 60.0s
-║   Packets: 600,000,000
-║   Rate: 10,000,000 pps
-║   Throughput: 112.0 Mbit/s
-║   Data: 840.0 MB
-╚════════════════════════════════════
-```
-
-## Configuration
-
-Settings are stored in:
-- **mau-send**: `~/.mau-send/config.json`
-- **mau-recv**: Uses command-line args (no persistent config)
-
-### Edit Sender Config
-```bash
-cat ~/.mau-send/config.json
-```
-
-Example config:
-```json
-{
-  "destination_address": "239.1.1.1",
-  "destination_port": 5005,
-  "packet_size": 1400,
-  "packets_per_second": 10000,
-  "dscp_value": 46,
-  "ttl": 32,
-  "time_sync_server": "localhost",
-  "time_sync_port": 443
-}
-```
-
-## DSCP Values
-
-Common DSCP values (divide by 2 for cos value):
-
-| DSCP | Name | Description |
-|------|------|-------------|
-| 0    | BE   | Best Effort |
-| 8    | CS1  | Class Selector 1 |
-| 10   | AF11 | Assured Forwarding 1,1 |
-| 16   | CS2  | Class Selector 2 |
-| 18   | AF21 | Assured Forwarding 2,1 |
-| 24   | CS3  | Class Selector 3 |
-| 26   | AF31 | Assured Forwarding 3,1 |
-| 32   | CS4  | Class Selector 4 |
-| 34   | AF41 | Assured Forwarding 4,1 |
-| 40   | CS5  | Class Selector 5 |
-| 46   | EF   | Expedited Forwarding |
-| 48   | CS6  | Class Selector 6 |
-| 56   | CS7  | Class Selector 7 |
-
-## Packet Format
+## Project Structure
 
 ```
-[0:4]   Sequence Number        (uint32)
-[4:12]  Timestamp µs           (uint64, relative to server start)
-[12:-4] Payload                (variable, 'X' bytes)
-[-4:]   CRC32                  (uint32)
+├── mau-send.py          # Traffic generator (sender + time sync server)
+├── mau-recv.py          # Traffic receiver with OWD measurement
+├── wireshark/
+│   ├── mau_protocol.lua # Wireshark Lua dissector
+│   └── README.md        # Dissector documentation
+└── README.md            # This file
 ```
-
-## Performance Notes
-
-### Maximum Throughput
-
-With **Burst Mode** on Apple M3 with Gigabit Ethernet:
-- **500+ Mbit/s** achieved
-- Limited by kernel UDP socket throughput
-- Larger packets (1400 bytes) = better efficiency
-
-### Optimal Settings
-
-| Scenario | Packet Size | Rate | Result |
-|----------|------------|------|--------|
-| Voice/Video | 256 bytes | 100 pps | 20 Kbit/s |
-| Audio Stream | 1024 bytes | 1000 pps | 8 Mbit/s |
-| Video Stream | 1400 bytes | 5000 pps | 56 Mbit/s |
-| Line Rate Test | 1400 bytes | --burst | 500+ Mbit/s |
 
 ## Requirements
 
-- Python 3.6+
-- Standard library only (no external dependencies)
-- Network with multicast support (for multicast testing)
+- Python 3.10+
+- No external packages
 
+## Author
+
+Ewald Jeitler — [www.jeitler.guru](https://www.jeitler.guru)

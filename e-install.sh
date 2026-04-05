@@ -3,6 +3,10 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 # e-install.sh by ewald@jeitler.cc 2026 https://www.jeitler.guru
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+# When I wrote this code, only God and I knew how it worked.
+# Now only God and the AI know it.
+# And since the AI helped write it… good luck to all of us.
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
 readonly VERSION="1.0"
 readonly SCRIPT_NAME="$(basename "$0")"
@@ -12,7 +16,6 @@ set -euo pipefail
 readonly CUSTOM_GITHUB_TOOLS=(
     "mau-recv.py|https://raw.githubusercontent.com/ewaldj/mau-tg/main/mau-recv.py"
     "mau-send.py|https://raw.githubusercontent.com/ewaldj/mau-tg/main/mau-send.py"
-    "mau-time.py|https://raw.githubusercontent.com/ewaldj/mau-tg/main/mau-time.py"
 )
 
 readonly DEFAULT_BINDIR="/usr/local/bin"

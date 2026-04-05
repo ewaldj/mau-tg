@@ -1,35 +1,44 @@
 #!/usr/bin/env python3
 # - - - - - - - - - - - - - - - - - - - - - - - -
-# mau-recv.py  by ewald@jeitler.cc 2026 https://www.jeitler.guru 
+# mau-recv.py  by ewald@jeitler.cc 2026 https://www.jeitler.guru
 # - - - - - - - - - - - - - - - - - - - - - - - -
-# When I wrote this code, only god and 
-# I knew how it worked. 
-# Now, only god knows it! 
-# - - - - - - - - - - - - - - - - - - - - - - - -
+# When I wrote this code, only God and I knew how it worked.
+# Now only God and the AI know it.
+# And since the AI helped write it… good luck to all of us.
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
-__version__ = "1.0"
+VERSION = "0.40"
 
 import argparse
 import socket
 import struct
 import time
+import json
 import sys
+import csv
+import threading
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
-import csv
+from typing import NamedTuple
 
 LOG_DIR = Path.home() / ".mau-recv"
+
+
+# --- Terminal colors ----------------------------------------------------------
 
 class Colors:
     CYAN = '\033[96m'
     GREEN = '\033[92m'
     YELLOW = '\033[93m'
     RED = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
+    BLUE = '\033[94m'
     GRAY = '\033[90m'
+    BOLD = '\033[1m'
+    ENDC = '\033[0m'
 
+
+# --- DSCP names ---------------------------------------------------------------
 
 DSCP_NAMES = {
     0: "BE", 8: "CS1", 10: "AF11", 12: "AF12", 14: "AF13", 16: "CS2",
@@ -43,385 +52,739 @@ def dscp_to_name(dscp):
     return DSCP_NAMES.get(dscp, f"DSCP-{dscp}")
 
 
-class TimeSyncClientV2:
-    """Time Sync Client v2 - Stores server time only at first sync"""
-    
-    def __init__(self, server_host='localhost', server_port=443):
-        self.server_host = server_host
-        self.server_port = server_port
-        self.server_time_at_sync = 0
-        self.local_time_at_sync = 0
-        self.synced = False
-    
-    def sync(self):
-        """Synchronize with server - only at startup"""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            
-            try:
-                sock.connect((self.server_host, self.server_port))
-            except:
-                self.server_port = 8443
-                sock.connect((self.server_host, self.server_port))
-            
-            sock.send(b'\x01RECEIVER')
-            response = sock.recv(8)
-            
-            if len(response) == 8:
-                self.server_time_at_sync = struct.unpack('!Q', response)[0]
-                self.local_time_at_sync = time.time()
-                self.synced = True
-                print(f"{Colors.GREEN}✓ Time Sync: Server time = {self.server_time_at_sync:d} µs{Colors.ENDC}")
-            
-            sock.close()
-        except Exception as e:
-            print(f"{Colors.YELLOW}⚠ Time Sync error: {e}{Colors.ENDC}")
-            self.synced = False
-    
-    def get_current_time_us(self):
-        """Get current time relative to server start"""
-        if self.synced:
-            local_elapsed_us = (time.time() - self.local_time_at_sync) * 1_000_000
-            return int(self.server_time_at_sync + local_elapsed_us)
-        return 0
+def format_elapsed(seconds):
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
+
+# --- OWD Sync Client ----------------------------------------------------------
+
+OWD_SYNC_PORT = 5556
+OWD_WARMUP_COUNT = 3
+OWD_RESYNC_INTERVAL = 30.0  # re-measure offset every N seconds
+
+
+class OWDSyncClient:
+    """OWD time sync client — measures clock offset to sender via 4-timestamp protocol.
+
+    Uses time.time_ns() (CLOCK_REALTIME) on both sides.
+    The sender embeds CLOCK_REALTIME timestamps (us) in data packets.
+    This client measures the clock offset between sender and receiver,
+    allowing accurate one-way delay calculation without a third-party time server.
+
+    The offset is re-measured periodically to track clock drift.
+    """
+
+    def __init__(self, sender_ip, sync_port=OWD_SYNC_PORT,
+                 resync_interval=OWD_RESYNC_INTERVAL):
+        self.sender_addr = (sender_ip, sync_port)
+        self.resync_interval = resync_interval
+
+        # clock offset in microseconds: sender_time = local_time + offset_us
+        self.offset_us = 0.0
+        self.rtt_ms = 0.0
+        self.synced = False
+
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread = None
+
+    def initial_sync(self) -> bool:
+        """Perform initial sync with warmup. Returns True on success."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(2.0)
+
+        try:
+            # warmup: prime ARP, conntrack, buffers
+            for _ in range(OWD_WARMUP_COUNT):
+                self._measure_once(sock)
+                time.sleep(0.05)
+
+            # actual measurement: take best of 5 (lowest RTT = most accurate)
+            results = []
+            for _ in range(5):
+                r = self._measure_once(sock)
+                if r is not None:
+                    results.append(r)
+                time.sleep(0.05)
+
+            if not results:
+                return False
+
+            # select measurement with lowest RTT (most accurate offset)
+            best = min(results, key=lambda x: x[0])
+            with self._lock:
+                self.rtt_ms = best[0]
+                self.offset_us = best[1]
+                self.synced = True
+
+            return True
+
+        except KeyboardInterrupt:
+            print(f"\n{Colors.YELLOW}⊘ Sync cancelled{Colors.ENDC}")
+            return False
+        except Exception as e:
+            print(f"{Colors.YELLOW}⚠ OWD sync error: {e}{Colors.ENDC}")
+            return False
+        finally:
+            sock.close()
+
+    def start_background_resync(self):
+        """Start background thread for periodic offset re-measurement."""
+        self._running = True
+        self._thread = threading.Thread(target=self._resync_loop, daemon=True)
+        self._thread.start()
+
+    def _resync_loop(self):
+        """Periodically re-measure clock offset to track drift."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(2.0)
+
+        while self._running:
+            time.sleep(self.resync_interval)
+            try:
+                results = []
+                for _ in range(3):
+                    r = self._measure_once(sock)
+                    if r is not None:
+                        results.append(r)
+                    time.sleep(0.05)
+
+                if results:
+                    best = min(results, key=lambda x: x[0])
+                    with self._lock:
+                        self.rtt_ms = best[0]
+                        self.offset_us = best[1]
+                        self.synced = True
+            except OSError:
+                pass
+
+        sock.close()
+
+    def _measure_once(self, sock) -> tuple | None:
+        """Single 4-timestamp measurement.
+
+        Returns (rtt_ms, offset_us) or None on failure.
+        """
+        request = json.dumps({
+            'type': 'req',
+            't1_ns': time.time_ns(),
+        }).encode('utf-8')
+
+        # stamp T1 as late as possible
+        t1_ns = time.time_ns()
+        request = json.dumps({
+            'type': 'req',
+            't1_ns': t1_ns,
+        }).encode('utf-8')
+
+        try:
+            sock.sendto(request, self.sender_addr)
+            data, _ = sock.recvfrom(1024)
+            t4_ns = time.time_ns()
+        except (socket.timeout, OSError):
+            return None
+
+        try:
+            msg = json.loads(data.decode('utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+
+        if msg.get('type') != 'rsp' or msg.get('t1_ns') != t1_ns:
+            return None
+
+        t2_ns = msg['t2_ns']
+        t3_ns = msg['t3_ns']
+
+        # RTT = (T4-T1) - (T3-T2)  (total round-trip minus server processing)
+        rtt_ns = (t4_ns - t1_ns) - (t3_ns - t2_ns)
+
+        # clock offset theta = ((T2-T1) + (T3-T4)) / 2
+        # positive = sender clock is ahead of receiver clock
+        offset_ns = ((t2_ns - t1_ns) + (t3_ns - t4_ns)) / 2.0
+
+        rtt_ms = rtt_ns / 1_000_000.0
+        offset_us = offset_ns / 1_000.0
+
+        return (rtt_ms, offset_us)
+
+    def get_delay_us(self, sender_timestamp_us: int) -> float | None:
+        """Compute one-way delay in microseconds from sender timestamp.
+
+        Returns None if not synced.
+
+        Derivation:
+          offset theta = ((T2-T1)+(T3-T4))/2 where T1/T4=receiver, T2/T3=sender
+          theta > 0 means sender clock is AHEAD of receiver clock
+          sender_time = receiver_time + theta
+          For a data packet:  receiver_now = sender_stamp - theta + delay
+          Therefore:          delay = receiver_now - sender_stamp + theta
+        """
+        with self._lock:
+            if not self.synced:
+                return None
+            offset = self.offset_us
+
+        local_us = time.time_ns() / 1_000.0
+        delay_us = local_us - sender_timestamp_us + offset
+        return delay_us
+
+    def stop(self):
+        self._running = False
+
+
+# --- Packet parsing -----------------------------------------------------------
+
+_HDR_STRUCT = struct.Struct('!IQ')   # seq(4) + timestamp(8)
+_CRC_STRUCT = struct.Struct('!I')    # crc(4)
+_MIN_PACKET_SIZE = _HDR_STRUCT.size + _CRC_STRUCT.size  # 16 bytes
+
+# UDP/IP header overhead: 20 bytes IP + 8 bytes UDP = 28 bytes
+# len(packet) returns UDP payload; add this for wire size display
+_UDP_IP_OVERHEAD = 28
+
+
+class PacketInfo(NamedTuple):
+    """Parsed packet data."""
+    seq: int
+    delay_ms: float | None  # None if sync unavailable
+    packet_size: int
+    dscp: int
+
+
+# --- Statistics ---------------------------------------------------------------
+
+class RunningStats:
+    """O(1) running statistics — no unbounded list growth."""
+    __slots__ = ('count', 'total', 'min_val', 'max_val')
+
+    def __init__(self):
+        self.count = 0
+        self.total = 0.0
+        self.min_val = float('inf')
+        self.max_val = float('-inf')
+
+    def add(self, value):
+        self.count += 1
+        self.total += value
+        if value < self.min_val:
+            self.min_val = value
+        if value > self.max_val:
+            self.max_val = value
+
+    @property
+    def avg(self):
+        return self.total / self.count if self.count else 0.0
+
+    @property
+    def minimum(self):
+        return self.min_val if self.count else 0.0
+
+    @property
+    def maximum(self):
+        return self.max_val if self.count else 0.0
+
+
+class DscpStats:
+    """Per-DSCP running statistics."""
+    __slots__ = ('packets', 'delays', 'loss')
+
+    def __init__(self):
+        self.packets = 0
+        self.delays = RunningStats()
+        self.loss = 0
+
+
+# --- Receiver -----------------------------------------------------------------
 
 class PacketReceiver:
-    def __init__(self, group, port, interface=None, log_file=None, summary_interval=None, sync_client=None, unicast_mode=False):
+    def __init__(self, group, port, interface=None, log_file=None,
+                 summary_interval=None, sync_client=None, unicast_mode=False):
         self.group = group
         self.port = port
         self.interface = interface
         self.log_file = log_file
         self.summary_interval = summary_interval
-        self.sync_client = sync_client or TimeSyncClientV2()
+        self.sync_client = sync_client
         self.unicast_mode = unicast_mode
-        
-        # For unicast: determine own IP
-        self.own_ip = None
-        if unicast_mode:
-            self.own_ip = self.get_own_ip()
-        
+
+        self.own_ip = self._get_own_ip() if unicast_mode else None
+
+        # counters (lifetime totals for final summary)
         self.total_packets = 0
         self.total_bytes = 0
-        self.all_delays = []
-        self.expected_seq = 0
+        self.delay_stats = RunningStats()
+
+        # interval counters (reset after each summary)
+        self.iv_packets = 0
+        self.iv_bytes = 0
+        self.iv_delay = RunningStats()
+        self.iv_missing = 0
+        self.iv_misorder = 0
+        self.iv_start_time = time.monotonic()
+
+        # sequence tracking
+        self.expected_seq = None
         self.last_seq = -1
         self.total_missing = 0
         self.total_misorder = 0
-        
-        self.dscp_stats = defaultdict(lambda: {'packets': 0, 'delays': [], 'loss': 0})
-        
-        self.start_time = time.time()
+
+        # per-DSCP (lifetime)
+        self.dscp_stats = defaultdict(DscpStats)
+        # per-DSCP (interval)
+        self.iv_dscp_stats = defaultdict(DscpStats)
+
+        # timing
+        self.start_time = time.monotonic()
         self.last_summary_time = self.start_time
-        
+
+        # CSV
         self.csv_file = None
         self.csv_writer = None
         if log_file:
-            self.csv_file = open(log_file, 'w', newline='')
+            self.csv_file = open(log_file, 'w', newline='', buffering=8192)
             self.csv_writer = csv.writer(self.csv_file)
-            self.csv_writer.writerow(['Timestamp', 'Seq', 'Delay_ms', 'DSCP', 'DSCP_Name', 'Status'])
-        
-        self.setup_socket()
-    
-    def get_own_ip(self):
-        """Determine own IP address"""
+            self.csv_writer.writerow([
+                'Timestamp', 'Seq', 'Delay_ms', 'DSCP', 'DSCP_Name', 'Status'
+            ])
+
+        self.sock = self._setup_socket()
+
+    @staticmethod
+    def _get_own_ip():
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.connect(("8.8.8.8", 80))
-            ip = sock.getsockname()[0]
-            sock.close()
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
             return ip
-        except:
+        except OSError:
             return "127.0.0.1"
-    
-    def setup_socket(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
-        # Enable TOS byte reception for DSCP
-        try:
-            if hasattr(socket, 'IP_RECVTOS'):
-                self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_RECVTOS, 1)
-        except:
-            pass
-        
-        if self.unicast_mode:
-            # Unicast: bind to own IP
-            self.sock.bind((self.own_ip, self.port))
-        else:
-            # Multicast
-            self.sock.bind(('', self.port))
-            
-            # Check if multicast or unicast
+
+    def _setup_socket(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        if hasattr(socket, 'IP_RECVTOS'):
             try:
-                group_int = struct.unpack('!I', socket.inet_aton(self.group))[0]
-                is_multicast = (group_int >= 0xE0000000) and (group_int <= 0xEFFFFFFF)
-            except:
-                is_multicast = False
-            
-            if is_multicast:
-                # Multicast setup
-                group = socket.inet_aton(self.group)
-                if self.interface:
-                    iface = socket.inet_aton(self.interface)
-                    mreq = struct.pack('4s4s', group, iface)
-                else:
-                    mreq = struct.pack('4sL', group, socket.INADDR_ANY)
-                
-                self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        
-        self.sock.settimeout(1.0)
-    
-    def extract_dscp_from_ancillary(self, ancillary):
-        """Extract DSCP from ancillary data (IP_RECVTOS)"""
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_RECVTOS, 1)
+            except OSError:
+                pass
+
+        if self.unicast_mode:
+            sock.bind((self.own_ip, self.port))
+        else:
+            sock.bind(('', self.port))
+            self._join_multicast(sock)
+
+        sock.settimeout(1.0)
+        return sock
+
+    def _join_multicast(self, sock):
+        if not self.group:
+            return
         try:
-            for level, type_, data in ancillary:
-                if level == socket.IPPROTO_IP and type_ == socket.IP_TOS:
-                    tos = data[0] if isinstance(data, bytes) else data
-                    return (tos >> 2) & 0x3F
-        except:
-            pass
+            group_int = struct.unpack('!I', socket.inet_aton(self.group))[0]
+        except OSError:
+            return
+
+        if not (0xE0000000 <= group_int <= 0xEFFFFFFF):
+            return
+
+        group_bytes = socket.inet_aton(self.group)
+        if self.interface:
+            iface_bytes = socket.inet_aton(self.interface)
+            mreq = struct.pack('4s4s', group_bytes, iface_bytes)
+        else:
+            mreq = struct.pack('4sL', group_bytes, socket.INADDR_ANY)
+
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+
+    @staticmethod
+    def _extract_dscp(ancillary):
+        for level, type_, data in ancillary:
+            if level == socket.IPPROTO_IP and type_ == socket.IP_TOS:
+                tos = data[0] if isinstance(data, bytes) else data
+                return (tos >> 2) & 0x3F
         return 0
-    
-    def process_packet(self, packet, dscp=0):
-        """Process packet - calculate delay relative to server"""
-        try:
-            if len(packet) < 16:
-                return None
-            
-            seq = struct.unpack('!I', packet[0:4])[0]
-            timestamp_us = struct.unpack('!Q', packet[4:12])[0]
-            crc = struct.unpack('!I', packet[-4:])[0]
-            
-            current_time_us = self.sync_client.get_current_time_us()
-            delay_us = current_time_us - timestamp_us
-            delay_ms = max(0, delay_us / 1000.0)
-            
-            return {
-                'seq': seq,
-                'delay_ms': delay_ms,
-                'packet_size': len(packet),
-                'dscp': dscp
-            }
-        except:
+
+    def _parse_packet(self, packet, dscp=0):
+        """Parse packet and compute one-way delay via OWD sync.
+
+        Returns PacketInfo. delay_ms is None if sync is unavailable.
+        """
+        if len(packet) < _MIN_PACKET_SIZE:
             return None
-    
-    def check_order(self, seq):
-        """Check sequence number order"""
-        # Initialize expected_seq on first packet received
-        if self.expected_seq == 0 and self.total_packets == 0:
+
+        try:
+            seq, timestamp_us = _HDR_STRUCT.unpack_from(packet, 0)
+        except struct.error:
+            return None
+
+        delay_ms = None
+        if self.sync_client:
+            delay_us = self.sync_client.get_delay_us(timestamp_us)
+            if delay_us is not None:
+                delay_ms = delay_us / 1000.0
+
+        return PacketInfo(
+            seq=seq,
+            delay_ms=delay_ms,
+            packet_size=len(packet) + _UDP_IP_OVERHEAD,  # wire size
+            dscp=dscp,
+        )
+
+    # Sender restart detection: if seq drops by more than this threshold
+    # relative to last_seq, treat it as a sender restart, not misorder.
+    _RESTART_THRESHOLD = 10
+
+    def _check_order(self, seq):
+        """Check sequence order. Returns (status, gap).
+
+        gap = number of missing packets for LOSS status, else 0.
+        Detects sender restart:
+          1) seq == 0 always indicates a fresh sender start
+          2) seq drops by more than _RESTART_THRESHOLD
+        """
+        if self.expected_seq is None:
             self.expected_seq = seq
-        
-        if seq < self.last_seq:
+
+        gap = 0
+        is_restart = False
+
+        if seq == 0 and self.last_seq > 0:
+            is_restart = True
+        elif seq < self.last_seq and (self.last_seq - seq) > self._RESTART_THRESHOLD:
+            is_restart = True
+
+        if is_restart:
+            print(f"{Colors.YELLOW}⚠ Sender restart detected "
+                  f"(seq {self.last_seq} → {seq}) — "
+                  f"resetting sequence tracker{Colors.ENDC}")
+            self.expected_seq = seq
+            self.last_seq = -1
+            status = 'RESTART'
+        elif seq < self.last_seq:
             self.total_misorder += 1
             status = 'MISORDER'
         elif seq > self.expected_seq:
-            missing_count = seq - self.expected_seq
-            self.total_missing += missing_count
+            gap = seq - self.expected_seq
+            self.total_missing += gap
             status = 'LOSS'
         else:
             status = 'OK'
-        
-        self.expected_seq = max(self.expected_seq, seq) + 1
+
+        if seq >= self.expected_seq:
+            self.expected_seq = seq + 1
         self.last_seq = max(self.last_seq, seq)
-        
-        return status
-    
-    def print_packet_line(self, result, status):
-        """Print per-packet display with DSCP"""
+
+        return status, gap
+
+    def _loss_pct(self):
+        total_expected = self.total_packets + self.total_missing
+        if total_expected <= 0:
+            return 0.0
+        return (self.total_missing / total_expected) * 100
+
+    def _print_packet_line(self, pkt, status):
         time_str = datetime.now().strftime('%H:%M:%S')
-        status_color = Colors.GREEN if status == 'OK' else Colors.YELLOW if status == 'LOSS' else Colors.RED
-        
-        loss_pct = (self.total_missing / self.expected_seq * 100) if self.expected_seq > 0 else 0
-        dscp_name = dscp_to_name(result['dscp'])
-        
-        print(f"{time_str} | Seq:{result['seq']:6d} | Size:{result['packet_size']:5d} "
-              f"| DSCP:{dscp_name:6s}| Delay:{result['delay_ms']:7.2f}ms |  {status_color}{status:5s}{Colors.ENDC} "
-              f"| Loss:{loss_pct:6.2f}%")
-    
-    def print_summary(self):
-        """Summary line with DSCP details"""
-        elapsed = time.time() - self.start_time
-        if self.total_packets == 0:
+        if status in ('OK', 'RESTART'):
+            sc = Colors.GREEN
+        elif status == 'LOSS':
+            sc = Colors.YELLOW
+        else:
+            sc = Colors.RED
+
+        if pkt.delay_ms is not None:
+            delay_str = f"Delay:{pkt.delay_ms:7.2f}ms"
+        else:
+            delay_str = "Delay:   n/a  "
+
+        print(f"{time_str} | Seq:{pkt.seq:6d} | Size:{pkt.packet_size:5d} "
+              f"| DSCP:{dscp_to_name(pkt.dscp):6s}| "
+              f"{delay_str} | {sc}{status:5s}{Colors.ENDC} "
+              f"| Loss:{self._loss_pct():6.2f}%")
+
+    def _print_summary(self):
+        """Print single-line interval summary."""
+        now = time.monotonic()
+        iv_elapsed = now - self.iv_start_time
+        total_elapsed = now - self.start_time
+
+        # time range as clean integer seconds
+        iv_end = round(total_elapsed)
+        iv_start = round(total_elapsed - iv_elapsed)
+        if iv_start < 0:
+            iv_start = 0
+        time_str = datetime.now().strftime('%H:%M:%S')
+        # fixed-width range: "   0–2s  " or " 100–102s" — always 10 chars
+        range_str = f"{iv_start}–{iv_end}s"
+        range_str = f"{range_str:>10s}"
+
+        if self.iv_packets == 0:
+            print(f"{time_str} | {range_str} "
+                  f"| {Colors.YELLOW}no traffic received{Colors.ENDC}")
+            self.iv_start_time = now
             return
-        
-        avg_delay = sum(self.all_delays) / len(self.all_delays) if self.all_delays else 0
-        throughput = (self.total_bytes * 8) / (elapsed * 1_000_000) if elapsed > 0 else 0
-        loss_pct = (self.total_missing / self.expected_seq * 100) if self.expected_seq > 0 else 0
-        
-        time_str = self.format_elapsed(elapsed)
-        
-        print(f"\n{Colors.CYAN}[{time_str}] Pkts:{self.total_packets:6d} "
-              f"Tput:{throughput:6.2f}Mbps Delay:{avg_delay:6.2f}ms "
-              f"Loss:{loss_pct:6.2f}% Misorder:{self.total_misorder:3d}{Colors.ENDC}")
-        
-        # DSCP details if multiple classes present
-        if len(self.dscp_stats) > 0:
-            for dscp in sorted(self.dscp_stats.keys()):
-                stats = self.dscp_stats[dscp]
-                if stats['packets'] > 0:
-                    dscp_name = dscp_to_name(dscp)
-                    dscp_percent = (stats['packets'] / self.total_packets * 100)
-                    dscp_avg_delay = sum(stats['delays']) / len(stats['delays']) if stats['delays'] else 0
-                    print(f"{Colors.GRAY}  └─ {dscp_name:6s}: {stats['packets']:6d} pkts ({dscp_percent:5.1f}%) "
-                          f"Delay:{dscp_avg_delay:6.2f}ms{Colors.ENDC}")
-        print()
-    
-    def format_elapsed(self, seconds):
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    
-    def print_final_summary(self):
-        """Final summary box"""
-        elapsed = time.time() - self.start_time
-        
+
+        # throughput
+        iv_throughput = (self.iv_bytes * 8) / (iv_elapsed * 1e6) if iv_elapsed > 0 else 0
+
+        # packet size
+        pkt_size = self.iv_bytes // self.iv_packets if self.iv_packets > 0 else 0
+
+        # dominant DSCP
+        if self.iv_dscp_stats:
+            top_dscp = max(self.iv_dscp_stats, key=lambda d: self.iv_dscp_stats[d].packets)
+        else:
+            top_dscp = 0
+
+        # delay
+        if self.iv_delay.count > 0:
+            delay_str = (f"Dly(ms): avg:{self.iv_delay.avg:.2f} "
+                         f"min:{self.iv_delay.minimum:.2f} "
+                         f"max:{self.iv_delay.maximum:.2f}")
+        else:
+            delay_str = "Dly(ms): n/a"
+
+        # loss
+        iv_expected = self.iv_packets + self.iv_missing
+        iv_loss_pct = (self.iv_missing / iv_expected * 100) if iv_expected > 0 else 0.0
+
+        # status
+        if self.iv_missing > 0:
+            status = 'LOSS'
+            sc = Colors.YELLOW
+        elif self.iv_misorder > 0:
+            status = 'MISORD'
+            sc = Colors.RED
+        else:
+            status = 'OK'
+            sc = Colors.GREEN
+
+        print(f"{time_str} | {range_str} "
+              f"| {iv_throughput:7.2f} Mbps "
+              f"| {pkt_size:5d}B "
+              f"| DSCP:{dscp_to_name(top_dscp):6s}"
+              f"| {sc}{status:6s}{Colors.ENDC} "
+              f"| Pkt:{self.iv_packets:9d} "
+              f"| Loss:{iv_loss_pct:5.2f}% Pkt:{self.iv_missing:6d} "
+              f"| {delay_str}")
+
+        # reset interval counters
+        self.iv_packets = 0
+        self.iv_bytes = 0
+        self.iv_delay = RunningStats()
+        self.iv_missing = 0
+        self.iv_misorder = 0
+        self.iv_dscp_stats = defaultdict(DscpStats)
+        self.iv_start_time = now
+
+    def _print_final_summary(self):
+        elapsed = time.monotonic() - self.start_time
+
         if self.total_packets == 0:
             print(f"{Colors.YELLOW}No packets received{Colors.ENDC}\n")
             return
-        
-        avg_delay = sum(self.all_delays) / len(self.all_delays) if self.all_delays else 0
-        min_delay = min(self.all_delays) if self.all_delays else 0
-        max_delay = max(self.all_delays) if self.all_delays else 0
-        throughput = (self.total_bytes * 8) / (elapsed * 1_000_000) if elapsed > 0 else 0
-        loss_pct = (self.total_missing / self.expected_seq * 100) if self.expected_seq > 0 else 0
-        
-        time_str = self.format_elapsed(elapsed)
-        
-        print(f"\n{Colors.GREEN}╔═══════════════════════════════════════{Colors.ENDC}")
+
+        throughput = (self.total_bytes * 8) / (elapsed * 1e6) if elapsed > 0 else 0
+        ds = self.delay_stats
+
+        print(f"\n{Colors.GREEN}╔═════════════════════════════════════════════════════╗{Colors.ENDC}")
         print(f"{Colors.GREEN}║  Final Statistics{Colors.ENDC}")
-        print(f"{Colors.GREEN}║  Time: {time_str}{Colors.ENDC}")
+        print(f"{Colors.GREEN}║  Time: {format_elapsed(elapsed)}{Colors.ENDC}")
         print(f"{Colors.GREEN}║  Packets: {self.total_packets:,}{Colors.ENDC}")
-        print(f"{Colors.GREEN}║  Data: {self.total_bytes / 1_000_000:.1f} MB{Colors.ENDC}")
+        print(f"{Colors.GREEN}║  Data: {self.total_bytes / 1e6:.1f} MB{Colors.ENDC}")
         print(f"{Colors.GREEN}║  Throughput: {throughput:.2f} Mbit/s{Colors.ENDC}")
-        print(f"{Colors.GREEN}║  Delay: {avg_delay:.2f}ms (min:{min_delay:.2f}ms max:{max_delay:.2f}ms){Colors.ENDC}")
-        print(f"{Colors.GREEN}║  Loss: {loss_pct:.2f}% ({self.total_missing} packets){Colors.ENDC}")
+        if ds.count > 0:
+            print(f"{Colors.GREEN}║  Delay: {ds.avg:.2f}ms "
+                  f"(min:{ds.minimum:.2f}ms max:{ds.maximum:.2f}ms){Colors.ENDC}")
+        else:
+            print(f"{Colors.GREEN}║  Delay: n/a (sync unavailable){Colors.ENDC}")
+        print(f"{Colors.GREEN}║  Loss: {self._loss_pct():.2f}% "
+              f"({self.total_missing} packets){Colors.ENDC}")
         print(f"{Colors.GREEN}║  Misorder: {self.total_misorder}{Colors.ENDC}")
-        print(f"{Colors.GREEN}╚═══════════════════════════════════════{Colors.ENDC}\n")
-    
+        print(f"{Colors.GREEN}╚═════════════════════════════════════════════════════╝{Colors.ENDC}\n")
+
     def receive_loop(self):
+        """Main receive loop."""
         if self.unicast_mode:
-            mode_text = f"Unicast (own IP: {self.own_ip})"
+            mode_text = f"Unicast only (local IP: {self.own_ip})"
         elif self.group:
-            mode_text = f"Multicast ({self.group})"
+            mode_text = f"Multicast {self.group}, Unicast and Broadcast"
         else:
             mode_text = "Unicast + Multicast"
-        
-        print(f"\n{Colors.GREEN}╔═══════════════════════════════════════{Colors.ENDC}")
-        print(f"{Colors.GREEN}║   Receiver running...{Colors.ENDC}")
+
+        sync_status = "active" if (self.sync_client and self.sync_client.synced) else "failed — set  -–sender-ip <ip>"
+
+        print(f"\n{Colors.GREEN}╔═════════════════════════════════════════════════════╗{Colors.ENDC}")
+        print(f"{Colors.GREEN}║   Receiver active{Colors.ENDC}")
         print(f"{Colors.GREEN}║   Mode: {mode_text:<28}{Colors.ENDC}")
         print(f"{Colors.GREEN}║   Port: {self.port:<33}{Colors.ENDC}")
+        print(f"{Colors.GREEN}║   OWD Sync: {sync_status:<29}{Colors.ENDC}")
         if self.summary_interval:
             print(f"{Colors.GREEN}║   Summary every {self.summary_interval}s{Colors.ENDC}")
         else:
-            print(f"{Colors.GREEN}║   Per-packet display{Colors.ENDC}")
-        print(f"{Colors.GREEN}║   CTRL+C to stop{Colors.ENDC}")
-        print(f"{Colors.GREEN}╚═══════════════════════════════════════{Colors.ENDC}\n")
-        
+            print(f"{Colors.GREEN}║   View: per-packet display{Colors.ENDC}")
+        print(f"{Colors.GREEN}║   Stop: CTRL+C{Colors.ENDC}")
+        print(f"{Colors.GREEN}╚═════════════════════════════════════════════════════╝{Colors.ENDC}\n")
+
+        use_recvmsg = hasattr(self.sock, 'recvmsg')
+
         try:
             while True:
                 try:
-                    # Receive packet with ancillary data (IP_RECVTOS)
-                    try:
-                        packet, ancillary, flags, addr = self.sock.recvmsg(65535, 256)
-                        dscp = self.extract_dscp_from_ancillary(ancillary)
-                    except (TypeError, AttributeError):
-                        # Fallback for systems without recvmsg
-                        packet, addr = self.sock.recvfrom(65535)
+                    if use_recvmsg:
+                        packet, ancillary, _flags, _addr = self.sock.recvmsg(
+                            65535, 256
+                        )
+                        dscp = self._extract_dscp(ancillary)
+                    else:
+                        packet, _addr = self.sock.recvfrom(65535)
                         dscp = 0
-                    
-                    current_time = time.time()
-                    
-                    result = self.process_packet(packet, dscp)
-                    if result:
-                        status = self.check_order(result['seq'])
-                        
-                        self.total_packets += 1
-                        self.total_bytes += result['packet_size']
-                        self.all_delays.append(result['delay_ms'])
-                        
-                        # Update DSCP stats
-                        dscp = result['dscp']
-                        self.dscp_stats[dscp]['packets'] += 1
-                        self.dscp_stats[dscp]['delays'].append(result['delay_ms'])
-                        if status == 'LOSS':
-                            self.dscp_stats[dscp]['loss'] += 1
-                        
-                        if self.csv_writer:
-                            self.csv_writer.writerow([
-                                datetime.now().isoformat(),
-                                result['seq'],
-                                f"{result['delay_ms']:.3f}",
-                                result['dscp'],
-                                dscp_to_name(result['dscp']),
-                                status
-                            ])
-                        
-                        # Display: per-packet or summary
-                        if not self.summary_interval:
-                            self.print_packet_line(result, status)
-                        elif current_time - self.last_summary_time >= self.summary_interval:
-                            self.print_summary()
-                            self.last_summary_time = current_time
-                
+
+                    pkt = self._parse_packet(packet, dscp)
+                    if pkt is None:
+                        continue
+
+                    status, gap = self._check_order(pkt.seq)
+
+                    self.total_packets += 1
+                    self.total_bytes += pkt.packet_size
+                    if pkt.delay_ms is not None:
+                        self.delay_stats.add(pkt.delay_ms)
+
+                    ds = self.dscp_stats[pkt.dscp]
+                    ds.packets += 1
+                    if pkt.delay_ms is not None:
+                        ds.delays.add(pkt.delay_ms)
+                    if status == 'LOSS':
+                        ds.loss += gap
+
+                    # interval counters
+                    self.iv_packets += 1
+                    self.iv_bytes += pkt.packet_size
+                    if pkt.delay_ms is not None:
+                        self.iv_delay.add(pkt.delay_ms)
+                    if status == 'LOSS':
+                        self.iv_missing += gap
+                    if status == 'MISORDER':
+                        self.iv_misorder += 1
+                        # late arrival of a previously loss-counted packet
+                        if self.iv_missing > 0:
+                            self.iv_missing -= 1
+
+                    iv_ds = self.iv_dscp_stats[pkt.dscp]
+                    iv_ds.packets += 1
+                    if pkt.delay_ms is not None:
+                        iv_ds.delays.add(pkt.delay_ms)
+                    if status == 'LOSS':
+                        iv_ds.loss += gap
+
+                    # CSV
+                    if self.csv_writer:
+                        self.csv_writer.writerow([
+                            datetime.now().isoformat(),
+                            pkt.seq,
+                            f"{pkt.delay_ms:.3f}" if pkt.delay_ms is not None else "",
+                            pkt.dscp,
+                            dscp_to_name(pkt.dscp),
+                            status,
+                        ])
+
+                    # display
+                    if not self.summary_interval:
+                        self._print_packet_line(pkt, status)
+                    else:
+                        now = time.monotonic()
+                        if now - self.last_summary_time >= self.summary_interval:
+                            self._print_summary()
+                            self.last_summary_time = now
+
                 except socket.timeout:
-                    if self.summary_interval and self.total_packets > 0:
-                        current_time = time.time()
-                        if current_time - self.last_summary_time >= self.summary_interval:
-                            self.print_summary()
-                            self.last_summary_time = current_time
-        
+                    if self.summary_interval:
+                        now = time.monotonic()
+                        if now - self.last_summary_time >= self.summary_interval:
+                            self._print_summary()
+                            self.last_summary_time = now
+
         except KeyboardInterrupt:
-            self.print_final_summary()
+            self._print_final_summary()
         finally:
             self.sock.close()
             if self.csv_file:
                 self.csv_file.close()
+            if self.sync_client:
+                self.sync_client.stop()
 
+
+# --- Main ---------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description='mau-recv v1.0 - Multicast/Unicast Traffic Receiver')
-    
-    parser.add_argument('-g', '--group', default='239.1.1.1', help='Multicast group (default: 239.1.1.1)')
-    parser.add_argument('-p', '--port', type=int, default=5005, help='Port (default: 5005)')
-    parser.add_argument('-u', '--unicast', action='store_true', help='Unicast mode (listen on own IP)')
-    parser.add_argument('-s', '--summary', type=int, help='Summary interval (seconds) - optional')
+    parser = argparse.ArgumentParser(
+        description=f'mau-recv v{VERSION} - Multicast/Unicast Traffic Receiver'
+    )
+    parser.add_argument('-g', '--group', default='239.1.1.1',
+                        help='Multicast group (default: 239.1.1.1)')
+    parser.add_argument('-p', '--port', type=int, default=5005,
+                        help='Data port (default: 5005)')
+    parser.add_argument('-u', '--unicast', action='store_true',
+                        help='Unicast mode (listen on own IP)')
+    parser.add_argument('-s', '--summary', type=int,
+                        help='Summary interval (seconds)')
     parser.add_argument('-l', '--log', help='CSV log file')
-    parser.add_argument('--sync-server', default='localhost', help='Time Sync Server')
-    parser.add_argument('--sync-port', type=int, default=443, help='Time Sync Port')
+    parser.add_argument('--sender-ip', default=None,
+                        help='Sender IP for OWD sync (required for delay measurement)')
+    parser.add_argument('--sync-port', type=int, default=OWD_SYNC_PORT,
+                        help=f'OWD sync port on sender (default: {OWD_SYNC_PORT})')
     parser.add_argument('--version', action='store_true', help='Version')
-    
+
     args = parser.parse_args()
-    
+
     if args.version:
-        print(f"mau-recv v{__version__}\n")
+        print(f"mau-recv v{VERSION}\n")
         return
-    
-    print(f"\n{Colors.CYAN}{Colors.BOLD}mau-recv v{__version__}{Colors.ENDC}\n")
-    
-    sync_client = TimeSyncClientV2(args.sync_server, args.sync_port)
-    print(f"{Colors.CYAN}Synchronizing with Time Sync Server...{Colors.ENDC}")
-    sync_client.sync()
-    
+
+    print(f"\n{Colors.BOLD}{Colors.BLUE}"
+          f"╔═════════════════════════════════════════════════════╗{Colors.ENDC}")
+    print(f"{Colors.BLUE}║  mau-recv v{VERSION} - by Ewald Jeitler {Colors.ENDC} ")
+    print(f"{Colors.BLUE}"
+          f"╚═════════════════════════════════════════════════════╝{Colors.ENDC}\n")
+
+
+
+    # OWD sync
+    sync_client = None
+    if args.sender_ip:
+        print(f"{Colors.CYAN}Synchronizing with sender {args.sender_ip}:{args.sync_port}...{Colors.ENDC}")
+        sync_client = OWDSyncClient(args.sender_ip, args.sync_port)
+        if sync_client.initial_sync():
+            print(f"{Colors.GREEN}✓ OWD sync OK — RTT: {sync_client.rtt_ms:.2f}ms, "
+                  f"offset: {sync_client.offset_us:+.1f}µs{Colors.ENDC}")
+            sync_client.start_background_resync()
+        else:
+            print(f"{Colors.YELLOW}⚠ OWD sync failed — delay values will not be shown{Colors.ENDC}")
+            sync_client = None
+    else:
+        print(f"{Colors.YELLOW}⚠ –sender-ip missing — delay values disabled{Colors.ENDC}")
+
     log_file = None
     if args.log:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_file = LOG_DIR / args.log
-    
-    # If -u is set, ignore -g for multicast join, but listen on both if -g is specified
+
     multicast_group = args.group if not args.unicast else None
-    
+
     receiver = PacketReceiver(
         multicast_group,
         args.port,
         log_file=log_file,
         summary_interval=args.summary,
         sync_client=sync_client,
-        unicast_mode=args.unicast
+        unicast_mode=args.unicast,
     )
-    
     receiver.receive_loop()
 
 

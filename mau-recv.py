@@ -7,7 +7,7 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
-VERSION = "0.41"
+VERSION = "0.42"
 
 import argparse
 import socket
@@ -63,7 +63,7 @@ def format_elapsed(seconds):
 
 OWD_SYNC_PORT = 5556
 OWD_WARMUP_COUNT = 3
-OWD_RESYNC_INTERVAL = 10.0  # re-measure offset every N seconds
+OWD_RESYNC_INTERVAL = 30.0  # re-measure offset every N seconds
 
 
 class OWDSyncClient:
@@ -86,11 +86,6 @@ class OWDSyncClient:
         self.offset_us = 0.0
         self.rtt_ms = 0.0
         self.synced = False
-
-        # drift compensation: track offset change rate (µs per second)
-        self._drift_rate = 0.0       # estimated drift in µs/s
-        self._last_sync_time = 0.0   # monotonic time of last sync
-        self._last_sync_offset = 0.0 # offset at last sync
 
         self._lock = threading.Lock()
         self._running = False
@@ -123,9 +118,6 @@ class OWDSyncClient:
             with self._lock:
                 self.rtt_ms = best[0]
                 self.offset_us = best[1]
-                self._last_sync_offset = best[1]
-                self._last_sync_time = time.monotonic()
-                self._drift_rate = 0.0
                 self.synced = True
 
             return True
@@ -146,12 +138,7 @@ class OWDSyncClient:
         self._thread.start()
 
     def _resync_loop(self):
-        """Periodically re-measure clock offset and estimate drift rate.
-
-        Instead of hard-jumping the offset, we compute the drift rate (µs/s)
-        and use it to interpolate between syncs. This eliminates the sawtooth
-        pattern caused by clock drift between sync points.
-        """
+        """Periodically re-measure clock offset to track drift."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(2.0)
 
@@ -167,19 +154,9 @@ class OWDSyncClient:
 
                 if results:
                     best = min(results, key=lambda x: x[0])
-                    new_offset = best[1]
-                    now = time.monotonic()
-
                     with self._lock:
-                        # compute drift rate from offset change
-                        dt = now - self._last_sync_time
-                        if dt > 1.0:
-                            self._drift_rate = (new_offset - self._last_sync_offset) / dt
-
                         self.rtt_ms = best[0]
-                        self.offset_us = new_offset
-                        self._last_sync_offset = new_offset
-                        self._last_sync_time = now
+                        self.offset_us = best[1]
                         self.synced = True
             except OSError:
                 pass
@@ -238,28 +215,20 @@ class OWDSyncClient:
 
         Returns None if not synced.
 
-        Uses drift-compensated offset: the measured offset at last sync is
-        extrapolated forward using the estimated drift rate (µs/s). This
-        prevents the sawtooth pattern caused by clock drift between syncs.
-
         Derivation:
           offset theta = ((T2-T1)+(T3-T4))/2 where T1/T4=receiver, T2/T3=sender
           theta > 0 means sender clock is AHEAD of receiver clock
-          For a data packet: delay = receiver_now - sender_stamp + theta
+          sender_time = receiver_time + theta
+          For a data packet:  receiver_now = sender_stamp - theta + delay
+          Therefore:          delay = receiver_now - sender_stamp + theta
         """
         with self._lock:
             if not self.synced:
                 return None
             offset = self.offset_us
-            drift_rate = self._drift_rate
-            sync_time = self._last_sync_time
-
-        # extrapolate offset using drift rate since last sync
-        dt = time.monotonic() - sync_time
-        interpolated_offset = offset + drift_rate * dt
 
         local_us = time.time_ns() / 1_000.0
-        delay_us = local_us - sender_timestamp_us + interpolated_offset
+        delay_us = local_us - sender_timestamp_us + offset
         return delay_us
 
     def stop(self):
@@ -397,6 +366,14 @@ class PacketReceiver:
     def _setup_socket(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # SO_REUSEPORT allows multiple processes to bind to the same port.
+        # Required on macOS/BSD; on Linux it enables kernel load-balancing.
+        if hasattr(socket, 'SO_REUSEPORT'):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
 
         if hasattr(socket, 'IP_RECVTOS'):
             try:

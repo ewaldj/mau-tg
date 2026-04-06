@@ -7,7 +7,7 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
-VERSION = "0.42"
+VERSION = "0.43"
 
 import argparse
 import socket
@@ -301,12 +301,14 @@ class DscpStats:
 
 class PacketReceiver:
     def __init__(self, group, port, interface=None, log_file=None,
-                 summary_interval=None, sync_client=None, unicast_mode=False):
+                 summary_interval=None, sync_client=None, unicast_mode=False,
+                 summary_compact=False):
         self.group = group
         self.port = port
         self.interface = interface
         self.log_file = log_file
         self.summary_interval = summary_interval
+        self.summary_compact = summary_compact
         self.sync_client = sync_client
         self.unicast_mode = unicast_mode
 
@@ -532,8 +534,12 @@ class PacketReceiver:
         range_str = f"{range_str:>10s}"
 
         if self.iv_packets == 0:
-            print(f"{time_str} | {range_str} "
-                  f"| {Colors.YELLOW}no traffic received{Colors.ENDC}")
+            if self.summary_compact:
+                print(f"{range_str} "
+                      f"| {Colors.YELLOW}no traffic{Colors.ENDC}")
+            else:
+                print(f"{time_str} | {range_str} "
+                      f"| {Colors.YELLOW}no traffic received{Colors.ENDC}")
             self.iv_start_time = now
             return
 
@@ -572,14 +578,25 @@ class PacketReceiver:
             status = 'OK'
             sc = Colors.GREEN
 
-        print(f"{time_str} | {range_str} "
-              f"| {iv_throughput:7.2f} Mbps "
-              f"| {pkt_size:5d}B "
-              f"| DSCP:{dscp_to_name(top_dscp):6s}"
-              f"| {sc}{status:6s}{Colors.ENDC} "
-              f"| Pkt:{self.iv_packets:9d} "
-              f"| Loss:{iv_loss_pct:5.2f}% Pkt:{self.iv_missing:6d} "
-              f"| {delay_str}")
+        if self.summary_compact:
+            # compact: no timestamp, no size, short DSCP, short delay
+            dly_str = f"Dly:{self.iv_delay.avg:.2f}" if self.iv_delay.count > 0 else "Dly:n/a"
+            print(f"{range_str} "
+                  f"| {iv_throughput:7.2f} Mbps "
+                  f"| {dscp_to_name(top_dscp):6s}"
+                  f"| {sc}{status:4s}{Colors.ENDC} "
+                  f"| Pkt:{self.iv_packets:9d} "
+                  f"| LPkt:{self.iv_missing:7d} "
+                  f"| {dly_str}")
+        else:
+            print(f"{time_str} | {range_str} "
+                  f"| {iv_throughput:7.2f} Mbps "
+                  f"| {pkt_size:5d}B "
+                  f"| DSCP:{dscp_to_name(top_dscp):6s}"
+                  f"| {sc}{status:6s}{Colors.ENDC} "
+                  f"| Pkt:{self.iv_packets:9d} "
+                  f"| Loss:{iv_loss_pct:5.2f}% Pkt:{self.iv_missing:6d} "
+                  f"| {delay_str}")
 
         # reset interval counters
         self.iv_packets = 0
@@ -742,6 +759,8 @@ def main():
                         help='Unicast mode (listen on own IP)')
     parser.add_argument('-s', '--summary', type=int,
                         help='Summary interval (seconds)')
+    parser.add_argument('-sc', '--summary-compact', type=int,
+                        help='Compact summary interval (seconds)')
     parser.add_argument('-l', '--log', help='CSV log file')
     parser.add_argument('--sender-ip', default=None,
                         help='Sender IP for OWD sync (required for delay measurement)')
@@ -785,11 +804,21 @@ def main():
 
     multicast_group = args.group if not args.unicast else None
 
+    # Resolve summary mode: -sc overrides -s
+    summary_interval = None
+    summary_compact = False
+    if args.summary_compact:
+        summary_interval = args.summary_compact
+        summary_compact = True
+    elif args.summary:
+        summary_interval = args.summary
+
     receiver = PacketReceiver(
         multicast_group,
         args.port,
         log_file=log_file,
-        summary_interval=args.summary,
+        summary_interval=summary_interval,
+        summary_compact=summary_compact,
         sync_client=sync_client,
         unicast_mode=args.unicast,
     )

@@ -217,7 +217,7 @@ def interactive_menu(config, sync_server):
             print(f"\n  {Colors.GREEN}0. START (Normal Mode){Colors.ENDC}")
             print(f"  {Colors.GREEN}b. BURST-MODE{Colors.ENDC}")
             print(f"  {Colors.YELLOW}s. Save Config{Colors.ENDC}")
-            print(f"  {Colors.RED}q. Exit{Colors.ENDC}\n")
+            print(f"  {Colors.RED}e. Exit{Colors.ENDC}\n")
 
             try:
                 choice = input(
@@ -227,7 +227,7 @@ def interactive_menu(config, sync_server):
                 print(f"\n{Colors.YELLOW}⊘ Cancelled{Colors.ENDC}\n")
                 return None
 
-            if choice == 'q':
+            if choice == 'e':
                 return None
             elif choice == 's':
                 save_config(config)

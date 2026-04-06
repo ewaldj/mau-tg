@@ -221,7 +221,7 @@ def interactive_menu(config, sync_server):
 
             try:
                 choice = input(
-                    f"{Colors.CYAN}Choose option [0-8/b/s/q]: {Colors.ENDC}"
+                    f"{Colors.CYAN}Choose option [0-8/b/s/e]: {Colors.ENDC}"
                 ).strip().lower()
             except (KeyboardInterrupt, EOFError):
                 print(f"\n{Colors.YELLOW}⊘ Cancelled{Colors.ENDC}\n")

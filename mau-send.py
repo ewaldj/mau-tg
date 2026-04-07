@@ -7,13 +7,14 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
-VERSION = "0.45"
+VERSION = "0.46"
 
 import socket
 import struct
 import sys
 import time
 import json
+import errno
 import argparse
 import threading
 from pathlib import Path
@@ -319,11 +320,22 @@ def _get_timestamp_us():
 
 
 def _pack_and_send(buf, seq, timestamp_us, sock, dest_addr):
-    """Pack header + CRC into pre-allocated buffer and send."""
+    """Pack header + CRC into pre-allocated buffer and send.
+
+    Retries on ENOBUFS (kernel send buffer full) with brief backoff.
+    """
     _HDR_STRUCT.pack_into(buf, 0, seq, timestamp_us)
     crc = sum(buf[:-_CRC_STRUCT.size]) & 0xFF
     _CRC_STRUCT.pack_into(buf, len(buf) - _CRC_STRUCT.size, crc)
-    sock.sendto(buf, dest_addr)
+    while True:
+        try:
+            sock.sendto(buf, dest_addr)
+            return
+        except OSError as e:
+            if e.errno == errno.ENOBUFS:
+                time.sleep(0.001)  # 1ms backoff, then retry
+                continue
+            raise
 
 
 def _print_banner(config, sync_server, mode_label):

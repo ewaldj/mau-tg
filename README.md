@@ -183,7 +183,7 @@ MAU uses a custom UDP protocol with embedded timestamps:
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                                                               |
 |                   Timestamp in µs (64)                        |
-|                    CLOCK_REALTIME                              |
+|                    CLOCK_REALTIME                             |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                      Payload Padding                          |
 |                    (filled with 0x58)                         |

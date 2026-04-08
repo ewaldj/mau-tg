@@ -15,7 +15,7 @@ A lightweight, dependency-free Python toolkit for generating and analyzing netwo
 - **Zero Dependencies** — Python 3.10+ standard library only
 - **Cross-Platform** — tested on Linux (x86/ARM), macOS, Raspberry Pi OS
 
-## Installation
+## Installation / Update 
 
 ```
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ewaldj/mau-tg/refs/heads/main/e-install.sh)"

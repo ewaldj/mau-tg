@@ -7,7 +7,7 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
-VERSION = "0.44"
+VERSION = "0.45"
 
 import argparse
 import socket
@@ -23,6 +23,9 @@ from collections import defaultdict
 from typing import NamedTuple
 
 LOG_DIR = Path.home() / ".mau-recv"
+
+# macOS does not export IP_RECVTOS in Python's socket module (value=27 on Darwin)
+_IP_RECVTOS = getattr(socket, 'IP_RECVTOS', 27)
 
 
 # --- Terminal colors ----------------------------------------------------------
@@ -382,6 +385,12 @@ class PacketReceiver:
                 sock.setsockopt(socket.IPPROTO_IP, socket.IP_RECVTOS, 1)
             except OSError:
                 pass
+        # macOS: also try the raw numeric value (27) in case not exported
+        if _IP_RECVTOS != getattr(socket, 'IP_RECVTOS', None):
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, _IP_RECVTOS, 1)
+            except OSError:
+                pass
 
         if self.unicast_mode:
             sock.bind((self.own_ip, self.port))
@@ -415,7 +424,7 @@ class PacketReceiver:
     @staticmethod
     def _extract_dscp(ancillary):
         for level, type_, data in ancillary:
-            if level == socket.IPPROTO_IP and type_ == socket.IP_TOS:
+            if level == socket.IPPROTO_IP and type_ in (socket.IP_TOS, _IP_RECVTOS):
                 tos = data[0] if isinstance(data, bytes) else data
                 return (tos >> 2) & 0x3F
         return 0

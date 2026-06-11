@@ -7,7 +7,7 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
-VERSION = "0.46"
+VERSION = "0.48"
 
 import socket
 import struct
@@ -159,6 +159,7 @@ def load_config():
         'ttl': 32,
         'sync_port': OWD_SYNC_PORT,
         'burst_mbps': 0,  # 0 = unlimited
+        'df_bit': False,
     }
     config_file = CONFIG_DIR / 'config.json'
     if config_file.exists():
@@ -215,6 +216,8 @@ def interactive_menu(config, sync_server):
             print(f"  6. OWD Sync Port:          {config['sync_port']}")
             print(f"  7. TTL:                    {config['ttl']}")
             print(f"  8. Burst Bandwidth Limit:  {burst_label}")
+            df_label = "on" if config.get('df_bit', False) else "off"
+            print(f"  9. Don't Fragment (DF):    {df_label}")
             print(f"\n  {Colors.GREEN}0. START (Normal Mode){Colors.ENDC}")
             print(f"  {Colors.GREEN}b. BURST-MODE{Colors.ENDC}")
             print(f"  {Colors.YELLOW}s. Save Config{Colors.ENDC}")
@@ -222,7 +225,7 @@ def interactive_menu(config, sync_server):
 
             try:
                 choice = input(
-                    f"{Colors.CYAN}Choose option [0-8/b/s/e]: {Colors.ENDC}"
+                    f"{Colors.CYAN}Choose option [0-9/b/s/e]: {Colors.ENDC}"
                 ).strip().lower()
             except (KeyboardInterrupt, EOFError):
                 print(f"\n{Colors.YELLOW}⊘ Cancelled{Colors.ENDC}\n")
@@ -247,6 +250,8 @@ def interactive_menu(config, sync_server):
                         sync_server.restart(new_port)
                 except ValueError:
                     print(f"{Colors.RED}✗ Invalid port{Colors.ENDC}")
+            elif choice == '9':
+                config['df_bit'] = not config.get('df_bit', False)
             elif choice in fields:
                 key, label, cast = fields[choice]
                 try:
@@ -296,6 +301,16 @@ def _create_send_socket(config):
                             config['dscp_value'] << 2)
         except OSError as e:
             print(f"{Colors.YELLOW}⚠ Could not set DSCP: {e}{Colors.ENDC}")
+
+    if config.get('df_bit', False):
+        if sys.platform == 'linux':
+            try:
+                # IP_MTU_DISCOVER=10, IP_PMTUDISC_DO=2
+                sock.setsockopt(socket.IPPROTO_IP, 10, 2)
+            except OSError as e:
+                print(f"{Colors.YELLOW}⚠ Could not set DF bit: {e}{Colors.ENDC}")
+        else:
+            print(f"{Colors.YELLOW}⚠ DF bit not supported on this platform (Linux only){Colors.ENDC}")
 
     return sock
 
@@ -355,6 +370,8 @@ def _print_banner(config, sync_server, mode_label):
         else:
             print(f"{Colors.GREEN}║   Bandwidth: unlimited{Colors.ENDC}")
     print(f"{Colors.GREEN}║   OWD Sync: port {sync_server.port}{Colors.ENDC}")
+    if config.get('df_bit', False):
+        print(f"{Colors.GREEN}║   DF bit: set{Colors.ENDC}")
     print(f"{Colors.GREEN}║   CTRL+C to stop{Colors.ENDC}")
     print(f"{Colors.GREEN}╚══════════════════════════════════════════════════════{Colors.ENDC}\n")
 
@@ -508,6 +525,8 @@ def main():
                         help='Burst mode')
     parser.add_argument('--burst-mbps', type=float,
                         help='Burst bandwidth limit in Mbit/s (0=unlimited)')
+    parser.add_argument('--df', action='store_true', default=None,
+                        help='Set Don\'t Fragment (DF) bit on all packets')
     parser.add_argument('-m', '--menu', action='store_true',
                         help='Interactive menu')
     parser.add_argument('--version', action='store_true', help='Version')
@@ -536,6 +555,8 @@ def main():
         val = getattr(args, arg_name, None)
         if val is not None:
             config[config_key] = val
+    if args.df:
+        config['df_bit'] = True
 
     mode = 'burst' if args.burst else 'normal'
 

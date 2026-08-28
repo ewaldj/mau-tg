@@ -7,7 +7,7 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
-VERSION = "0.46"
+VERSION = "0.50"
 
 import argparse
 import socket
@@ -15,7 +15,6 @@ import struct
 import time
 import json
 import sys
-sys.stdout.reconfigure(line_buffering=True)
 import csv
 import threading
 from datetime import datetime
@@ -24,6 +23,8 @@ from collections import defaultdict
 from typing import NamedTuple
 
 LOG_DIR = Path.home() / ".mau-recv"
+
+sys.stdout.reconfigure(line_buffering=True)
 
 # macOS does not export IP_RECVTOS in Python's socket module (value=27 on Darwin)
 _IP_RECVTOS = getattr(socket, 'IP_RECVTOS', 27)
@@ -63,22 +64,75 @@ def format_elapsed(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def clamp_delay_ms(delay_ms):
+    """Floor a one-way delay estimate at 0 for display purposes.
+
+    A negative reading can't be a real one-way delay - it's measurement
+    noise (clock-sync jitter, or the symmetric-path assumption behind the
+    4-timestamp exchange not quite holding) around a true delay close to
+    zero. We floor it here so the screen doesn't show something
+    physically impossible; the raw, unclamped value is still written to
+    the CSV log so nothing is lost for later analysis.
+    """
+    if delay_ms is None:
+        return None
+    return delay_ms if delay_ms >= 0 else 0.0
+
+
+# --- Kernel RX timestamping ----------------------------------------------------
+# See mau-send.py for the rationale. Same mechanism used here for both the
+# OWD sync exchange (T4) and for timestamping received data packets.
+
+_HAS_TIMESTAMPNS = hasattr(socket, 'SO_TIMESTAMPNS')
+_TIMESPEC_STRUCT = struct.Struct('ll')  # struct timespec (tv_sec, tv_nsec)
+
+
+def _extract_kernel_rx_ns(ancdata):
+    """Extract a kernel RX timestamp (CLOCK_REALTIME, ns) from SO_TIMESTAMPNS
+    ancillary data. Returns None if absent."""
+    if not ancdata:
+        return None
+    for level, type_, data in ancdata:
+        if level == socket.SOL_SOCKET and type_ == socket.SO_TIMESTAMPNS:
+            sec, nsec = _TIMESPEC_STRUCT.unpack_from(data, 0)
+            return sec * 1_000_000_000 + nsec
+    return None
+
+
 # --- OWD Sync Client ----------------------------------------------------------
 
 OWD_SYNC_PORT = 5556
 OWD_WARMUP_COUNT = 3
-OWD_RESYNC_INTERVAL = 30.0  # re-measure offset every N seconds
+OWD_RESYNC_INTERVAL = 15.0  # re-measure offset every N seconds (was 30s;
+                            # shorter interval + drift tracking below keeps
+                            # the offset estimate tighter between syncs)
+OWD_INITIAL_SAMPLE_COUNT = 16  # samples for the initial sync (blocking, once)
+OWD_RESYNC_SAMPLE_COUNT = 8    # samples per periodic resync (background thread)
+OWD_HISTORY_LEN = 8            # sliding window used for the drift-rate estimate
+_MAX_DRIFT_US_PER_S = 200.0    # sanity clamp (~200ppm; real crystals drift far less;
+                                # guards against a wild slope after e.g. a suspend/resume gap)
 
 
 class OWDSyncClient:
     """OWD time sync client — measures clock offset to sender via 4-timestamp protocol.
 
-    Uses time.time_ns() (CLOCK_REALTIME) on both sides.
+    Uses time.time_ns() (CLOCK_REALTIME) on both sides, backed by kernel
+    RX timestamps (SO_TIMESTAMPNS) where available.
     The sender embeds CLOCK_REALTIME timestamps (us) in data packets.
     This client measures the clock offset between sender and receiver,
     allowing accurate one-way delay calculation without a third-party time server.
 
-    The offset is re-measured periodically to track clock drift.
+    Two important limitations of this approach (inherent to any two-way
+    exchange without a shared external reference, e.g. GPS/PTP):
+      - It assumes the forward and return paths have equal delay. Any
+        asymmetry (different queuing, routing, media) biases the offset,
+        which can make small real delays appear slightly negative.
+      - Between syncs the local clock can drift; we now track and
+        extrapolate that drift (see _estimate_drift), but it's still an
+        estimate, not a hardware-disciplined clock.
+    Neither is "fixable" without an external time reference, but more
+    samples, outlier rejection, kernel-level timestamps and drift
+    tracking substantially reduce the noise on top of those limits.
     """
 
     def __init__(self, sender_ip, sync_port=OWD_SYNC_PORT,
@@ -91,6 +145,12 @@ class OWDSyncClient:
         self.rtt_ms = 0.0
         self.synced = False
 
+        # drift tracking: offset is extrapolated between resyncs as
+        # offset_us + drift_us_per_s * (now - last_update)
+        self._drift_us_per_s = 0.0
+        self._last_update_mono = time.monotonic()
+        self._history = []  # [(monotonic_time, offset_us), ...] newest last
+
         self._lock = threading.Lock()
         self._running = False
         self._thread = None
@@ -99,6 +159,7 @@ class OWDSyncClient:
         """Perform initial sync with warmup. Returns True on success."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(2.0)
+        self._enable_rx_timestamping(sock)
 
         try:
             # warmup: prime ARP, conntrack, buffers
@@ -106,24 +167,19 @@ class OWDSyncClient:
                 self._measure_once(sock)
                 time.sleep(0.05)
 
-            # actual measurement: take best of 5 (lowest RTT = most accurate)
+            # actual measurement: sample many, then apply the clock filter
             results = []
-            for _ in range(5):
+            for _ in range(OWD_INITIAL_SAMPLE_COUNT):
                 r = self._measure_once(sock)
                 if r is not None:
                     results.append(r)
                 time.sleep(0.05)
 
-            if not results:
+            best = self._select_best(results)
+            if best is None:
                 return False
 
-            # select measurement with lowest RTT (most accurate offset)
-            best = min(results, key=lambda x: x[0])
-            with self._lock:
-                self.rtt_ms = best[0]
-                self.offset_us = best[1]
-                self.synced = True
-
+            self._apply_measurement(*best)
             return True
 
         except KeyboardInterrupt:
@@ -145,39 +201,115 @@ class OWDSyncClient:
         """Periodically re-measure clock offset to track drift."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(2.0)
+        self._enable_rx_timestamping(sock)
 
         while self._running:
             time.sleep(self.resync_interval)
             try:
                 results = []
-                for _ in range(3):
+                for _ in range(OWD_RESYNC_SAMPLE_COUNT):
                     r = self._measure_once(sock)
                     if r is not None:
                         results.append(r)
                     time.sleep(0.05)
 
-                if results:
-                    best = min(results, key=lambda x: x[0])
-                    with self._lock:
-                        self.rtt_ms = best[0]
-                        self.offset_us = best[1]
-                        self.synced = True
+                best = self._select_best(results)
+                if best is not None:
+                    self._apply_measurement(*best)
             except OSError:
                 pass
 
         sock.close()
+
+    @staticmethod
+    def _enable_rx_timestamping(sock):
+        if _HAS_TIMESTAMPNS:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_TIMESTAMPNS, 1)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _select_best(results):
+        """NTP-style clock filter over a batch of (rtt_ms, offset_us) samples.
+
+        Rejects RTT outliers via a median/MAD filter (a scheduling hiccup
+        on either host can spike a single sample's RTT), then returns the
+        remaining sample with the lowest RTT - the lowest-RTT sample is
+        the one least affected by queuing delay in either direction, so
+        it gives the most trustworthy offset estimate.
+        """
+        if not results:
+            return None
+        if len(results) < 4:
+            return min(results, key=lambda r: r[0])
+
+        rtts = sorted(r[0] for r in results)
+        n = len(rtts)
+        median = rtts[n // 2] if n % 2 else (rtts[n // 2 - 1] + rtts[n // 2]) / 2.0
+        deviations = sorted(abs(r - median) for r in rtts)
+        mad = deviations[n // 2] if n % 2 else (deviations[n // 2 - 1] + deviations[n // 2]) / 2.0
+        # at least 0.5ms slack so a near-zero MAD (very stable link) doesn't
+        # reject every sample outright
+        threshold = median + max(3 * mad, 0.5)
+
+        filtered = [r for r in results if r[0] <= threshold]
+        if not filtered:
+            filtered = results
+        return min(filtered, key=lambda r: r[0])
+
+    def _apply_measurement(self, rtt_ms, offset_us):
+        """Record a new offset measurement and update the drift estimate."""
+        now = time.monotonic()
+        with self._lock:
+            self.rtt_ms = rtt_ms
+            self.offset_us = offset_us
+            self._last_update_mono = now
+            self.synced = True
+
+            self._history.append((now, offset_us))
+            if len(self._history) > OWD_HISTORY_LEN:
+                self._history.pop(0)
+
+            self._drift_us_per_s = self._estimate_drift()
+
+    def _estimate_drift(self):
+        """Least-squares slope of offset-vs-time over recent history.
+
+        Must be called with self._lock held. Returns 0.0 until there's
+        enough history to fit a trend, and clamps the result to a
+        physically sane range so a fluke (e.g. a resync after the process
+        was suspended for a while) can't produce a wild extrapolation.
+        """
+        pts = self._history
+        n = len(pts)
+        if n < 3:
+            return 0.0
+
+        t0 = pts[0][0]
+        xs = [p[0] - t0 for p in pts]
+        ys = [p[1] for p in pts]
+        mean_x = sum(xs) / n
+        mean_y = sum(ys) / n
+        denom = sum((x - mean_x) ** 2 for x in xs)
+        if denom == 0:
+            return 0.0
+        slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
+        return max(-_MAX_DRIFT_US_PER_S, min(_MAX_DRIFT_US_PER_S, slope))
+
+    def _current_offset_us(self):
+        """Must be called with self._lock held. Extrapolates the last
+        measured offset forward using the tracked drift rate, instead of
+        holding it flat until the next resync."""
+        elapsed = time.monotonic() - self._last_update_mono
+        return self.offset_us + self._drift_us_per_s * elapsed
 
     def _measure_once(self, sock) -> tuple | None:
         """Single 4-timestamp measurement.
 
         Returns (rtt_ms, offset_us) or None on failure.
         """
-        request = json.dumps({
-            'type': 'req',
-            't1_ns': time.time_ns(),
-        }).encode('utf-8')
-
-        # stamp T1 as late as possible
+        # stamp T1 as late as possible, right before sending
         t1_ns = time.time_ns()
         request = json.dumps({
             'type': 'req',
@@ -186,8 +318,14 @@ class OWDSyncClient:
 
         try:
             sock.sendto(request, self.sender_addr)
-            data, _ = sock.recvfrom(1024)
-            t4_ns = time.time_ns()
+            if _HAS_TIMESTAMPNS:
+                data, ancdata, _flags, _addr = sock.recvmsg(
+                    1024, socket.CMSG_SPACE(_TIMESPEC_STRUCT.size)
+                )
+                t4_ns = _extract_kernel_rx_ns(ancdata) or time.time_ns()
+            else:
+                data, _addr = sock.recvfrom(1024)
+                t4_ns = time.time_ns()
         except (socket.timeout, OSError):
             return None
 
@@ -214,10 +352,15 @@ class OWDSyncClient:
 
         return (rtt_ms, offset_us)
 
-    def get_delay_us(self, sender_timestamp_us: int) -> float | None:
+    def get_delay_us(self, sender_timestamp_us: int,
+                      local_ts_us: float | None = None) -> float | None:
         """Compute one-way delay in microseconds from sender timestamp.
 
         Returns None if not synced.
+
+        local_ts_us lets the caller pass a kernel RX timestamp (preferred,
+        lower jitter) for the local receive time; if omitted, falls back
+        to time.time_ns() at call time.
 
         Derivation:
           offset theta = ((T2-T1)+(T3-T4))/2 where T1/T4=receiver, T2/T3=sender
@@ -229,10 +372,11 @@ class OWDSyncClient:
         with self._lock:
             if not self.synced:
                 return None
-            offset = self.offset_us
+            offset = self._current_offset_us()
 
-        local_us = time.time_ns() / 1_000.0
-        delay_us = local_us - sender_timestamp_us + offset
+        if local_ts_us is None:
+            local_ts_us = time.time_ns() / 1_000.0
+        delay_us = local_ts_us - sender_timestamp_us + offset
         return delay_us
 
     def stop(self):
@@ -393,6 +537,12 @@ class PacketReceiver:
             except OSError:
                 pass
 
+        if _HAS_TIMESTAMPNS:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_TIMESTAMPNS, 1)
+            except OSError:
+                pass
+
         if self.unicast_mode:
             sock.bind((self.own_ip, self.port))
         else:
@@ -423,17 +573,28 @@ class PacketReceiver:
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
     @staticmethod
-    def _extract_dscp(ancillary):
+    def _extract_ancillary(ancillary):
+        """Pull both DSCP and the kernel RX timestamp out of one recvmsg()
+        ancillary-data list. Returns (dscp, rx_ns) - rx_ns is None if
+        SO_TIMESTAMPNS isn't available/enabled."""
+        dscp = 0
+        rx_ns = None
         for level, type_, data in ancillary:
             if level == socket.IPPROTO_IP and type_ in (socket.IP_TOS, _IP_RECVTOS):
                 tos = data[0] if isinstance(data, bytes) else data
-                return (tos >> 2) & 0x3F
-        return 0
+                dscp = (tos >> 2) & 0x3F
+            elif _HAS_TIMESTAMPNS and level == socket.SOL_SOCKET and type_ == socket.SO_TIMESTAMPNS:
+                sec, nsec = _TIMESPEC_STRUCT.unpack_from(data, 0)
+                rx_ns = sec * 1_000_000_000 + nsec
+        return dscp, rx_ns
 
-    def _parse_packet(self, packet, dscp=0):
+    def _parse_packet(self, packet, dscp=0, rx_ns=None):
         """Parse packet and compute one-way delay via OWD sync.
 
         Returns PacketInfo. delay_ms is None if sync is unavailable.
+        rx_ns, when given, is the kernel-timestamped packet arrival time
+        (CLOCK_REALTIME, ns) and is used in place of a fresh
+        time.time_ns() call to avoid scheduling jitter.
         """
         if len(packet) < _MIN_PACKET_SIZE:
             return None
@@ -445,7 +606,8 @@ class PacketReceiver:
 
         delay_ms = None
         if self.sync_client:
-            delay_us = self.sync_client.get_delay_us(timestamp_us)
+            local_ts_us = (rx_ns / 1000.0) if rx_ns is not None else None
+            delay_us = self.sync_client.get_delay_us(timestamp_us, local_ts_us)
             if delay_us is not None:
                 delay_ms = delay_us / 1000.0
 
@@ -518,7 +680,11 @@ class PacketReceiver:
             sc = Colors.RED
 
         if pkt.delay_ms is not None:
-            delay_str = f"Delay:{pkt.delay_ms:7.2f}ms"
+            disp = clamp_delay_ms(pkt.delay_ms)
+            # "~" marks a reading that was actually negative (measurement
+            # noise / path asymmetry) and got floored to 0 for display
+            marker = "~" if pkt.delay_ms < 0 else " "
+            delay_str = f"Delay:{marker}{disp:6.2f}ms"
         else:
             delay_str = "Delay:   n/a  "
 
@@ -675,34 +841,38 @@ class PacketReceiver:
                         packet, ancillary, _flags, _addr = self.sock.recvmsg(
                             65535, 256
                         )
-                        dscp = self._extract_dscp(ancillary)
+                        dscp, rx_ns = self._extract_ancillary(ancillary)
                     else:
                         packet, _addr = self.sock.recvfrom(65535)
-                        dscp = 0
+                        dscp, rx_ns = 0, None
 
-                    pkt = self._parse_packet(packet, dscp)
+                    pkt = self._parse_packet(packet, dscp, rx_ns)
                     if pkt is None:
                         continue
 
                     status, gap = self._check_order(pkt.seq)
 
+                    # clamped (>=0) delay for on-screen stats/averages; the
+                    # raw, possibly-negative pkt.delay_ms still goes to CSV
+                    disp_delay = clamp_delay_ms(pkt.delay_ms)
+
                     self.total_packets += 1
                     self.total_bytes += pkt.packet_size
-                    if pkt.delay_ms is not None:
-                        self.delay_stats.add(pkt.delay_ms)
+                    if disp_delay is not None:
+                        self.delay_stats.add(disp_delay)
 
                     ds = self.dscp_stats[pkt.dscp]
                     ds.packets += 1
-                    if pkt.delay_ms is not None:
-                        ds.delays.add(pkt.delay_ms)
+                    if disp_delay is not None:
+                        ds.delays.add(disp_delay)
                     if status == 'LOSS':
                         ds.loss += gap
 
                     # interval counters
                     self.iv_packets += 1
                     self.iv_bytes += pkt.packet_size
-                    if pkt.delay_ms is not None:
-                        self.iv_delay.add(pkt.delay_ms)
+                    if disp_delay is not None:
+                        self.iv_delay.add(disp_delay)
                     if status == 'LOSS':
                         self.iv_missing += gap
                     if status == 'MISORDER':
@@ -713,8 +883,8 @@ class PacketReceiver:
 
                     iv_ds = self.iv_dscp_stats[pkt.dscp]
                     iv_ds.packets += 1
-                    if pkt.delay_ms is not None:
-                        iv_ds.delays.add(pkt.delay_ms)
+                    if disp_delay is not None:
+                        iv_ds.delays.add(disp_delay)
                     if status == 'LOSS':
                         iv_ds.loss += gap
 

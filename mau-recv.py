@@ -7,7 +7,7 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
-VERSION = "0.45"
+VERSION = "0.46"
 
 import argparse
 import socket
@@ -15,6 +15,7 @@ import struct
 import time
 import json
 import sys
+sys.stdout.reconfigure(line_buffering=True)
 import csv
 import threading
 from datetime import datetime

@@ -7,13 +7,20 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
-VERSION = "0.50"
+VERSION = "0.53"
+# v0.51: OWD sync wire protocol switched from JSON to a fixed-size struct
+#        (see mau-send.py for the rationale). Breaking wire-format change -
+#        sender and receiver must be updated together.
+# v0.52: new --resync-interval CLI option to override OWD_RESYNC_INTERVAL
+#        (default unchanged: 15s).
+# v0.53: OWD_RESYNC_INTERVAL default lowered 15s -> 3s (still overridable
+#        via --resync-interval). Tighter drift tracking at the cost of a
+#        bit more sync traffic (8 samples/round, every 3s).
 
 import argparse
 import socket
 import struct
 import time
-import json
 import sys
 import csv
 import threading
@@ -99,13 +106,26 @@ def _extract_kernel_rx_ns(ancdata):
     return None
 
 
+# --- OWD sync wire protocol (binary, fixed-size) --------------------------
+# Must stay identical to the definitions in mau-send.py.
+
+_SYNC_MSG_REQ = 0x01
+_SYNC_MSG_RSP = 0x02
+
+_SYNC_REQ_STRUCT = struct.Struct('!BQ')     # type(1) + t1_ns(8)              =  9 bytes
+_SYNC_RSP_STRUCT = struct.Struct('!BQQQ')   # type(1) + t1_ns/t2_ns/t3_ns(8*3) = 25 bytes
+_SYNC_RECV_BUFSIZE = 64  # generous margin over the 25-byte response
+
+
 # --- OWD Sync Client ----------------------------------------------------------
 
 OWD_SYNC_PORT = 5556
 OWD_WARMUP_COUNT = 3
-OWD_RESYNC_INTERVAL = 15.0  # re-measure offset every N seconds (was 30s;
-                            # shorter interval + drift tracking below keeps
-                            # the offset estimate tighter between syncs)
+OWD_RESYNC_INTERVAL = 3.0   # re-measure offset every N seconds (was 30s,
+                            # then 15s; shorter interval + drift tracking
+                            # below keeps the offset estimate tighter
+                            # between syncs, at the cost of more sync
+                            # traffic - override with --resync-interval)
 OWD_INITIAL_SAMPLE_COUNT = 16  # samples for the initial sync (blocking, once)
 OWD_RESYNC_SAMPLE_COUNT = 8    # samples per periodic resync (background thread)
 OWD_HISTORY_LEN = 8            # sliding window used for the drift-rate estimate
@@ -305,40 +325,37 @@ class OWDSyncClient:
         return self.offset_us + self._drift_us_per_s * elapsed
 
     def _measure_once(self, sock) -> tuple | None:
-        """Single 4-timestamp measurement.
+        """Single 4-timestamp measurement (fixed-size binary protocol).
 
         Returns (rtt_ms, offset_us) or None on failure.
         """
-        # stamp T1 as late as possible, right before sending
+        # stamp T1 as late as possible, right before sending - no encode
+        # step (json.dumps) sits between the stamp and the actual send
         t1_ns = time.time_ns()
-        request = json.dumps({
-            'type': 'req',
-            't1_ns': t1_ns,
-        }).encode('utf-8')
+        request = _SYNC_REQ_STRUCT.pack(_SYNC_MSG_REQ, t1_ns)
 
         try:
             sock.sendto(request, self.sender_addr)
             if _HAS_TIMESTAMPNS:
                 data, ancdata, _flags, _addr = sock.recvmsg(
-                    1024, socket.CMSG_SPACE(_TIMESPEC_STRUCT.size)
+                    _SYNC_RECV_BUFSIZE, socket.CMSG_SPACE(_TIMESPEC_STRUCT.size)
                 )
                 t4_ns = _extract_kernel_rx_ns(ancdata) or time.time_ns()
             else:
-                data, _addr = sock.recvfrom(1024)
+                data, _addr = sock.recvfrom(_SYNC_RECV_BUFSIZE)
                 t4_ns = time.time_ns()
         except (socket.timeout, OSError):
             return None
 
+        if len(data) != _SYNC_RSP_STRUCT.size:
+            return None
         try:
-            msg = json.loads(data.decode('utf-8'))
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            msg_type, resp_t1_ns, t2_ns, t3_ns = _SYNC_RSP_STRUCT.unpack(data)
+        except struct.error:
             return None
 
-        if msg.get('type') != 'rsp' or msg.get('t1_ns') != t1_ns:
+        if msg_type != _SYNC_MSG_RSP or resp_t1_ns != t1_ns:
             return None
-
-        t2_ns = msg['t2_ns']
-        t3_ns = msg['t3_ns']
 
         # RTT = (T4-T1) - (T3-T2)  (total round-trip minus server processing)
         rtt_ns = (t4_ns - t1_ns) - (t3_ns - t2_ns)
@@ -946,6 +963,8 @@ def main():
                         help='Sender IP for OWD sync (required for delay measurement)')
     parser.add_argument('--sync-port', type=int, default=OWD_SYNC_PORT,
                         help=f'OWD sync port on sender (default: {OWD_SYNC_PORT})')
+    parser.add_argument('--resync-interval', type=float, default=OWD_RESYNC_INTERVAL,
+                        help=f'OWD resync interval in seconds (default: {OWD_RESYNC_INTERVAL:.0f})')
     parser.add_argument('--version', action='store_true', help='Version')
 
     args = parser.parse_args()
@@ -965,8 +984,10 @@ def main():
     # OWD sync
     sync_client = None
     if args.sender_ip:
-        print(f"{Colors.CYAN}Synchronizing with sender {args.sender_ip}:{args.sync_port}...{Colors.ENDC}")
-        sync_client = OWDSyncClient(args.sender_ip, args.sync_port)
+        print(f"{Colors.CYAN}Synchronizing with sender {args.sender_ip}:{args.sync_port} "
+              f"(resync every {args.resync_interval:.0f}s)...{Colors.ENDC}")
+        sync_client = OWDSyncClient(args.sender_ip, args.sync_port,
+                                     resync_interval=args.resync_interval)
         if sync_client.initial_sync():
             print(f"{Colors.GREEN}✓ OWD sync OK — RTT: {sync_client.rtt_ms:.2f}ms, "
                   f"offset: {sync_client.offset_us:+.1f}µs{Colors.ENDC}")

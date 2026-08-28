@@ -1,11 +1,8 @@
-# MAU Protocol — Wireshark Dissectors
+# MAU Protocol — Wireshark Dissector
 
-Two Lua dissector plugins for [Wireshark](https://www.wireshark.org/) that decode the protocols used by `mau-send` and `mau-recv`:
+Lua dissector plugin for [Wireshark](https://www.wireshark.org/) that decodes the MAU traffic generator protocol used by `mau-send` and `mau-recv`.
 
-- **`mau_protocol.lua`** — the data-plane traffic packets (default UDP port 5005). Format unchanged since the first release.
-- **`mau_owd_sync_protocol.lua`** — the OWD (one-way delay) clock-sync exchange between `mau-recv` and `mau-send`'s embedded sync server (default UDP port 5556, `--sync-port`). Binary `struct` format, **v0.51+ only** — see [Compatibility](../README.md#installation--update) in the main README.
-
-## Data Packet Protocol Format
+## Protocol Format
 
 MAU uses UDP to transmit fixed-size packets with embedded timestamps for one-way delay measurement.
 
@@ -58,39 +55,6 @@ Seq=42  Len=1500B  CRC=OK
 
 CRC mismatches are flagged as expert info errors and highlighted in the packet list.
 
-## OWD Sync Protocol Format
-
-Dissected by `mau_owd_sync_protocol.lua`. Fixed-size binary messages exchanged between `mau-recv` and `mau-send`'s embedded sync server — this is how `mau-recv` measures its clock offset (see `--sender-ip` / `--sync-port` / `--resync-interval` in the main README). **v0.51+ only** — earlier versions used JSON on the wire, which this dissector does not decode.
-
-| Message | Size | Layout |
-|---------|------|--------|
-| Request | 9 bytes | `[0]` type = `0x01` · `[1:9]` t1_ns (uint64 BE) |
-| Response | 25 bytes | `[0]` type = `0x02` · `[1:9]` t1_ns · `[9:17]` t2_ns · `[17:25]` t3_ns (all uint64 BE) |
-
-All timestamps are `CLOCK_REALTIME` nanoseconds since the Unix epoch. A packet of any other size, or with an unrecognized type byte, is left to other dissectors rather than misparsed.
-
-### Wireshark Decoded View (OWD Sync)
-
-```
-▼ MAU OWD Sync Protocol
-    Message Type: 0x02 (RSP - sync response)
-    T1 - Receiver TX (ns since epoch): 1787941343040081408
-    T1 (UTC): 2026-08-28 18:22:23.040081 UTC
-    T2 - Sender RX (ns since epoch): 1787941343040231408
-    T2 (UTC): 2026-08-28 18:22:23.040231 UTC
-    T3 - Sender TX (ns since epoch): 1787941343040239408
-    T3 (UTC): 2026-08-28 18:22:23.040239 UTC
-    Server Processing Time (T3-T2, ns): 8000
-```
-
-Info column:
-
-```
-MAU OWD Sync RSP  t1=2026-08-28 18:22:23.040081 UTC  server_proc=8000ns
-```
-
-`Server Processing Time` (T3−T2) is the one leg of the exchange kernel RX timestamping doesn't reach (see the main README's Delay Measurement section) — a growing value there under load is a direct sign of scheduling/GC jitter on the sender host.
-
 ## Installation
 
 1. Find your Wireshark personal plugins directory:
@@ -104,43 +68,39 @@ MAU OWD Sync RSP  t1=2026-08-28 18:22:23.040081 UTC  server_proc=8000ns
    | macOS | `~/.local/lib/wireshark/plugins/` |
    | Windows | `%APPDATA%\Wireshark\plugins\` |
 
-2. Copy both dissector files (install just one if you only need it):
+2. Copy the dissector file:
 
    ```bash
    # Linux / macOS
    mkdir -p ~/.local/lib/wireshark/plugins
-   cp mau_protocol.lua mau_owd_sync_protocol.lua ~/.local/lib/wireshark/plugins/
+   cp mau_protocol.lua ~/.local/lib/wireshark/plugins/
    ```
 
    ```powershell
    # Windows (PowerShell)
-   Copy-Item mau_protocol.lua,mau_owd_sync_protocol.lua "$env:APPDATA\Wireshark\plugins\"
+   Copy-Item mau_protocol.lua "$env:APPDATA\Wireshark\plugins\"
    ```
 
 3. Reload: restart Wireshark or press **Ctrl+Shift+L** to reload Lua plugins.
 
 ## Usage
 
-`mau_protocol.lua` registers on **UDP port 5005** (default `mau-send` data port) and `mau_owd_sync_protocol.lua` on **UDP port 5556** (default `--sync-port`) automatically.
+The dissector automatically registers on **UDP port 5005** (the default `mau-send` data port).
 
-For a different port: right-click any UDP packet → **Decode As…** → set UDP port → select **MAU** or **MAU-OWD**.
+For a different port: right-click any UDP packet → **Decode As…** → set UDP port → select **MAU**.
 
 ### Display Filters
 
 ```
-mau                          # all MAU data-packet traffic
+mau                          # all MAU packets
 mau.seq >= 1000              # sequence number filter
 mau.crc_status == "MISMATCH" # CRC errors only
-
-mau_owd                              # all MAU OWD sync traffic
-mau_owd.type == 0x02                 # sync responses only
-mau_owd.server_processing_ns > 5000  # slow server-side processing (ns)
 ```
 
 ### Capture Filter
 
 ```bash
-wireshark -i eth0 -f "udp port 5005 or udp port 5556"
+wireshark -i eth0 -f "udp port 5005"
 ```
 
 ## Related

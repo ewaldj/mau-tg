@@ -7,7 +7,15 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
-VERSION = "0.50"
+VERSION = "0.51"
+# v0.51: OWD sync wire protocol switched from JSON to a fixed-size struct.
+#        Removes json encode/decode overhead (and the dict allocations
+#        that could nudge the cyclic GC) from between the T1/T3
+#        timestamps and the actual sendto() call - the one part of the
+#        timing-critical path kernel RX timestamping (v0.49) doesn't
+#        reach. Sender and receiver must be updated together - this is
+#        a breaking wire-format change, old and new versions of
+#        mau-send.py/mau-recv.py won't sync with each other.
 
 import socket
 import struct
@@ -57,6 +65,20 @@ def _extract_kernel_rx_ns(ancdata):
             sec, nsec = _TIMESPEC_STRUCT.unpack_from(data, 0)
             return sec * 1_000_000_000 + nsec
     return None
+
+
+# --- OWD sync wire protocol (binary, fixed-size) --------------------------
+# Replaces the earlier JSON messages. Each message starts with a 1-byte
+# type tag so a malformed/foreign UDP packet on this port is rejected on
+# size+tag mismatch rather than raising a decode error somewhere downstream.
+# This format must stay identical between mau-send.py and mau-recv.py.
+
+_SYNC_MSG_REQ = 0x01
+_SYNC_MSG_RSP = 0x02
+
+_SYNC_REQ_STRUCT = struct.Struct('!BQ')     # type(1) + t1_ns(8)              =  9 bytes
+_SYNC_RSP_STRUCT = struct.Struct('!BQQQ')   # type(1) + t1_ns/t2_ns/t3_ns(8*3) = 25 bytes
+_SYNC_RECV_BUFSIZE = 64  # generous margin over the 25-byte response
 
 
 # --- OWD Time Sync Server (runs inside sender) -------------------------------
@@ -123,11 +145,11 @@ class OWDSyncServer:
             try:
                 if _HAS_TIMESTAMPNS:
                     data, ancdata, _flags, addr = sock.recvmsg(
-                        1024, socket.CMSG_SPACE(_TIMESPEC_STRUCT.size)
+                        _SYNC_RECV_BUFSIZE, socket.CMSG_SPACE(_TIMESPEC_STRUCT.size)
                     )
                     t2_ns = _extract_kernel_rx_ns(ancdata) or time.time_ns()
                 else:
-                    data, addr = sock.recvfrom(1024)
+                    data, addr = sock.recvfrom(_SYNC_RECV_BUFSIZE)
                     t2_ns = time.time_ns()
                 self._handle_request(sock, data, addr, t2_ns)
             except socket.timeout:
@@ -140,23 +162,20 @@ class OWDSyncServer:
         sock.close()
 
     def _handle_request(self, sock, data, addr, t2_ns):
-        """Process a single timing request."""
+        """Process a single timing request (fixed-size binary protocol)."""
+        if len(data) != _SYNC_REQ_STRUCT.size:
+            return
         try:
-            msg = json.loads(data.decode('utf-8'))
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            msg_type, t1_ns = _SYNC_REQ_STRUCT.unpack(data)
+        except struct.error:
+            return
+        if msg_type != _SYNC_MSG_REQ:
             return
 
-        if msg.get('type') != 'req':
-            return
-
+        # t3 stamped as close to sendto() as possible - no encode step
+        # (json.dumps) sits between the stamp and the actual send anymore
         t3_ns = time.time_ns()
-        response = json.dumps({
-            'type': 'rsp',
-            't1_ns': msg.get('t1_ns', 0),
-            't2_ns': t2_ns,
-            't3_ns': t3_ns,
-        }).encode('utf-8')
-
+        response = _SYNC_RSP_STRUCT.pack(_SYNC_MSG_RSP, t1_ns, t2_ns, t3_ns)
         sock.sendto(response, addr)
 
         with self._lock:

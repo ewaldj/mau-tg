@@ -7,12 +7,11 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
-VERSION = "0.49"
+VERSION = "0.50"
 
 import socket
 import struct
 import sys
-sys.stdout.reconfigure(line_buffering=True)
 import time
 import json
 import errno
@@ -20,6 +19,7 @@ import argparse
 import threading
 from pathlib import Path
 
+sys.stdout.reconfigure(line_buffering=True)
 
 # --- Terminal colors ----------------------------------------------------------
 
@@ -32,6 +32,31 @@ class Colors:
     GRAY = '\033[90m'
     BOLD = '\033[1m'
     ENDC = '\033[0m'
+
+
+# --- Kernel RX timestamping ----------------------------------------------------
+# SO_TIMESTAMPNS gives us the packet arrival time as stamped by the kernel
+# (CLOCK_REALTIME), instead of calling time.time_ns() in Python after
+# recvfrom()/recvmsg() returns. That Python-level call can be delayed by
+# scheduler/GIL jitter of a few hundred microseconds to low milliseconds -
+# the same order of magnitude as the one-way delays we're trying to
+# measure, so it's a real (and avoidable) source of noise. Linux-only;
+# other platforms silently fall back to time.time_ns().
+
+_HAS_TIMESTAMPNS = hasattr(socket, 'SO_TIMESTAMPNS')
+_TIMESPEC_STRUCT = struct.Struct('ll')  # struct timespec (tv_sec, tv_nsec)
+
+
+def _extract_kernel_rx_ns(ancdata):
+    """Extract a kernel RX timestamp (CLOCK_REALTIME, ns) from SO_TIMESTAMPNS
+    ancillary data. Returns None if absent."""
+    if not ancdata:
+        return None
+    for level, type_, data in ancdata:
+        if level == socket.SOL_SOCKET and type_ == socket.SO_TIMESTAMPNS:
+            sec, nsec = _TIMESPEC_STRUCT.unpack_from(data, 0)
+            return sec * 1_000_000_000 + nsec
+    return None
 
 
 # --- OWD Time Sync Server (runs inside sender) -------------------------------
@@ -77,6 +102,12 @@ class OWDSyncServer:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.settimeout(1.0)
 
+        if _HAS_TIMESTAMPNS:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_TIMESTAMPNS, 1)
+            except OSError:
+                pass
+
         try:
             sock.bind((self.bind_addr, self.port))
         except OSError as e:
@@ -90,8 +121,14 @@ class OWDSyncServer:
 
         while self._running:
             try:
-                data, addr = sock.recvfrom(1024)
-                t2_ns = time.time_ns()
+                if _HAS_TIMESTAMPNS:
+                    data, ancdata, _flags, addr = sock.recvmsg(
+                        1024, socket.CMSG_SPACE(_TIMESPEC_STRUCT.size)
+                    )
+                    t2_ns = _extract_kernel_rx_ns(ancdata) or time.time_ns()
+                else:
+                    data, addr = sock.recvfrom(1024)
+                    t2_ns = time.time_ns()
                 self._handle_request(sock, data, addr, t2_ns)
             except socket.timeout:
                 continue

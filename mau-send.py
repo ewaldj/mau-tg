@@ -7,11 +7,12 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
-VERSION = "0.48"
+VERSION = "0.49"
 
 import socket
 import struct
 import sys
+sys.stdout.reconfigure(line_buffering=True)
 import time
 import json
 import errno
